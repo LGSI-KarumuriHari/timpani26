@@ -1,97 +1,167 @@
-# SOME/IP 및 TIMPANI RT 연동 애플리케이션 예제 패키지
+# Running the FCW example (L1 TT + L2 CBS) with TIMPANI
 
-본 패키지는 **DDR-008** 설계 사양을 바탕으로, SOME/IP 디스패치 경계 기반의 이벤트 감시 및 스케줄링(TT 및 CBS) 연동 흐름을 보여주는 예제 모음입니다.
+Step-by-step flow for running `mock_radar_producer` (L1 TT) and `fcw_consumer` (L2 CBS) under
+timpani-o / timpani-n, plus the commands to inject every anomaly.
 
----
-
-## 📂 폴더 구조 및 구성
-
-```
-someip/
-├── CMakeLists.txt              # 통합 빌드 파일
-├── README.md                   # 본 도움말 파일
-├── include/
-│   ├── timpani_rt.h            # DDR-008 표준 TIMPANI FFI C 헤더
-│   └── vsomeip/
-│       └── vsomeip.hpp         # 루프백 UDP 통신 기능이 내장된 Mock vsomeip 헤더
-├── src/
-│   └── libtimpani_rt.cpp       # FNV-1a 해싱 및 바인딩 시뮬레이터 (공통)
-├── radar_based_fcw/            # 1. ADAS FCW 시뮬레이션 예제 (Mock vsomeip 기반)
-│   ├── CMakeLists.txt
-│   ├── mock_radar_producer.cpp # L1 TT 레이더 센서 노드 모사 (Publisher, 20ms 주기)
-│   ├── fcw_consumer.cpp        # L2 CBS 전방 추돌 제어 모사 (Subscriber, 경보 및 FFI 연동)
-│   └── dummy_tasks.cpp         # 백그라운드 L1 TT 더미 태스크 시뮬레이터
-└── hello_world/                # 2. COVESA 표준 헬로월드 예제 (실제 vsomeip3 연동)
-    ├── CMakeLists.txt
-    ├── hello_world_service_main.cpp
-    ├── hello_world_service.hpp # L2 CBS 스케줄러 바인딩 적용
-    ├── hello_world_client_main.cpp
-    ├── hello_world_client.hpp  # L1 TT 주기적 전송 루프 스레드 적용
-    └── helloworld-local.json   # vsomeip 통신 설정 파일
-```
-
----
-
-## 🛠️ 빌드 방법
-
-컴파일 및 빌드는 표준 CMake를 사용합니다. 실제 COVESA `vsomeip3` 라이브러리가 호스트 시스템에 설치되어 있어야 `hello_world` 서브프로젝트가 정상 빌드됩니다.
+Replace `<path-to-timpani>` with the location of your TIMPANI checkout:
 
 ```bash
-# examples/someip 폴더로 이동
-cd TIMPANI/examples/someip
-
-# 빌드 디렉토리 생성 및 빌드
-mkdir build && cd build
-cmake ..
-make
+export TIMPANI_ROOT=<path-to-timpani>
 ```
 
-빌드가 성공하면 `build/` 내부의 각 하위 폴더에 실행 파일들이 생성됩니다.
+Terminals used below: **T1** consumer, **T2** producer, **T3** timpani-o, **T4** timpani-n,
+**T5** pullpiri mock.
 
 ---
 
-## 🚦 예제 상세 설명
+## 1. Prerequisites
 
-### 1. `radar_based_fcw` (ADAS FCW 시뮬레이션)
-호스트 환경에 별도의 vsomeip 라이브러리가 없는 상태에서도 즉시 빌드 및 실행해 볼 수 있도록 루프백 UDP 소켓 기반의 mock_vsomeip 헤더를 사용하여 구동됩니다.
-* **mock_radar_producer (L1 TT)**: 20ms마다 장애물 거리 데이터를 생성해 SOME/IP Event로 송출합니다.
-* **fcw_consumer (L2 CBS)**: 이벤트를 수신하면 디스패치 경계 마킹(`timpani_evt_mark_arrival`) 및 CBS 스레드 바인딩(`timpani_cbs_bind_thread`) 하에 전방 충돌 경고(FCW) 알고리즘을 연산합니다.
-
-### 2. `hello_world` (COVESA 표준 vsomeip 연동 + Timpani 적용)
-실제 COVESA vsomeip3 미들웨어를 사용하여 통신하며, Timpani API를 실제 연동한 예제입니다.
-* **vsomeip_hello_world_client (L1 TT)**:
-  * 서비스 사용 가능 상태가 되면 별도의 L1 TT 송신 스레드(`hello_tt_task`)를 기동합니다.
-  * `timpani_tt_register()` 및 `timpani_tt_wait_period()`를 사용해 100ms 주기로 `"World"` 데이터를 담은 request를 정밀 전송합니다.
-* **vsomeip_hello_world_service (L2 CBS)**:
-  * `timpani_evt_register()`를 통해 서비스/인스턴스/메서드 계약을 등록합니다.
-  * request를 수신하는 디스패치 콜백 `on_message_cbk` 진입 직후 `timpani_evt_mark_arrival()`로 이벤트 도착 시간 $t_0$를 마킹합니다.
-  * 비즈니스 로직 수행 전 `timpani_cbs_bind_thread()`를 통해 스레드를 CBS로 바인딩하고, 완료 후 `timpani_cbs_unbind_thread()`로 바인딩을 해제합니다.
+- Build the example: `cd $TIMPANI_ROOT/examples/someip && mkdir -p build && cd build && cmake .. && make -j$(nproc)`
+- Build timpani-o and timpani-n (`$TIMPANI_ROOT/timpani-o/build`, `$TIMPANI_ROOT/timpani-n/build`).
+- Python virtual environment with the dependencies of `scripts/mock_pullpiri.py` in
+  `$TIMPANI_ROOT/scripts/.venv`.
+- Run the two applications from a shell that is inside the isolated-CPU cgroup, otherwise they cannot
+  use the isolated CPUs (see section 5.3 of `README.md`).
 
 ---
 
-## 🏃 실행 및 테스트 방법
+## 2. Workload definition
 
-### 1. `radar_based_fcw` 실행
+`$TIMPANI_ROOT/scripts/mock_pullpiri.yaml` is what the pullpiri mock sends:
+
+```yaml
+# SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+# SPDX-License-Identifier: MIT
+
+workloads:
+  - workload_id: fcw_producer_tt
+    temporal_class: TEMPORAL_PERIODIC
+    tasks:
+      - name: tt_task
+        priority: 20
+        policy: FIFO
+        cpu_affinity: 0x1
+        period: 20000
+        runtime: 2000
+        deadline: 20000
+        release_time: 0
+        max_dmiss: 2
+
+  - workload_id: verify_wl_cbs
+    temporal_class: TEMPORAL_SPORADIC
+    tasks:
+      - name: cbs_task
+        priority: 18
+        policy: FIFO
+        cpu_affinity: 0x1
+        period: 20000
+        runtime: 2000
+        deadline: 5000
+        release_time: 0
+        max_dmiss: 2
+```
+
+- `name` must equal the thread name of the task: `tt_task` is the producer's publishing thread,
+  `cbs_task` is the consumer's worker thread (maximum 15 characters).
+- `max_dmiss` is the number of deadline misses tolerated before the fault is forwarded to timpani-o.
+- The CPU is chosen by timpani-o from `available_cpus` (next section); `policy` and `cpu_affinity`
+  are not used for placement.
+
+---
+
+## 3. Node configuration (timpani-o)
+
+`$TIMPANI_ROOT/timpani-o/examples/node_configurations.yaml` lists the CPUs timpani-o may use on
+each node:
+
+```yaml
+# TTRT Global Scheduler - Node Configuration File
+# Hardware description of each node
+
+nodes:
+  <node-id>:                      # must match the node id of timpani-n (hostname, or the -n option)
+    available_cpus: [2]
+    max_memory_mb: 4096
+    architecture: "aarch64"
+    location: "front_sensor_unit"
+    description: "Autonomous driving perception and sensor fusion node"
+```
+
+`available_cpus` must list the **isolated** CPUs, for example `[2, 3]`.
+`[2]` is used here on purpose so that both tasks are scheduled on the same CPU for testing.
+
+---
+
+## 4. Execution order
+
+Start the applications first: the task threads must already exist when timpani-n applies the table.
+
+**T1 - consumer**
 ```bash
-# Terminal 1: Consumer 실행 (CBS 과부하 시뮬레이션 옵션: --overrun-ms 5)
+cd $TIMPANI_ROOT/examples/someip/build
 LD_LIBRARY_PATH=. ./radar_based_fcw/fcw_consumer
-
-# Terminal 2: Producer 실행 (MIT 위반 시뮬레이션 옵션: --burst-ms 5)
-./radar_based_fcw/mock_radar_producer
 ```
 
-### 2. `hello_world` 실행
-실제 vsomeip 공유 라이브러리 및 설정 파일 경로를 환경 변수로 지정해야 합니다.
-
+**T2 - producer**
 ```bash
-# Terminal 1: Service 기동
-export VSOMEIP_CONFIGURATION=../hello_world/helloworld-local.json
-export VSOMEIP_APPLICATION_NAME=hello_world_service
-LD_LIBRARY_PATH=.:$LD_LIBRARY_PATH ./hello_world/vsomeip_hello_world_service
-
-# Terminal 2: Client 기동
-export VSOMEIP_CONFIGURATION=../hello_world/helloworld-local.json
-export VSOMEIP_APPLICATION_NAME=hello_world_client
-LD_LIBRARY_PATH=.:$LD_LIBRARY_PATH ./hello_world/vsomeip_hello_world_client
+cd $TIMPANI_ROOT/examples/someip/build
+LD_LIBRARY_PATH=. ./radar_based_fcw/mock_radar_producer
 ```
-* **동작 관찰**: Client 스레드가 L1 TT 정밀 주기에 맞춰 Request를 주기 송신하고, Service 측의 콜백 스레드가 L2 CBS 바인딩 하에 응답을 처리하는 로깅을 콘솔에서 실시간으로 확인할 수 있습니다.
+
+Both applications now wait: the producer for the futex wake-up from timpani-n, the consumer for events.
+
+**T3 - timpani-o**
+```bash
+cd $TIMPANI_ROOT/timpani-o/build
+sudo ./timpani-o -c ../examples/node_configurations.yaml
+```
+
+**T4 - timpani-n**
+```bash
+cd $TIMPANI_ROOT/timpani-n/build
+sudo ./timpani-n            # add -g to record the scheduling slices (<node-id>.gpdata)
+```
+
+**T5 - pullpiri mock (last)**
+```bash
+cd $TIMPANI_ROOT/scripts
+source .venv/bin/activate
+python mock_pullpiri.py --config mock_pullpiri.yaml
+```
+
+Expected timpani-n output after T5:
+```
+[main] Registered task in BPF: tt_task pid=<tid> type=TT ...
+[main] Applied SCHED_EXT to tt_task pid=<tid>
+[main] Applied SCHED_EXT to CBS cbs_task pid=<tid>
+[main] Registered CBS task in BPF: cbs_task ... budget=2000us period=20000us
+```
+The producer then runs every 20 ms. Frames are published once the target is closer than 15 m, and the
+consumer logs `Processed Frame ...`.
+
+---
+
+## 5. Simulating anomalies
+
+Restart T1 and T2 for each case. A restarted application has new thread ids, so also **restart T4
+(timpani-n)**: when it reconnects, timpani-o replays the stored table and the new threads are
+registered. Run the commands from `$TIMPANI_ROOT/examples/someip/build` with
+`export LD_LIBRARY_PATH=.`.
+
+| Case | T1 (consumer) | T2 (producer) | Evidence |
+|---|---|---|---|
+| Normal | `./radar_based_fcw/fcw_consumer` | `./radar_based_fcw/mock_radar_producer` | no anomalies |
+| MIT violation | normal | `./radar_based_fcw/mock_radar_producer --burst-ms 5` | consumer log: `MIT VIOLATION ... < mit=18000us` |
+| Wakeup latency | `./radar_based_fcw/fcw_consumer --wakeup-delay-ms 5` | normal | consumer log: `WAKEUP/E2E LATENCY EXCEEDED` (limit 3 ms) |
+| Budget exceeded | `./radar_based_fcw/fcw_consumer --overrun-ms 10` | normal | `FAULT_BUDGET_EXCEED` in the timpani-n log |
+| TT deadline miss | normal | `./radar_based_fcw/mock_radar_producer --tt-overrun-ms 25` | `Dmiss` lines for `tt_task`, fault to timpani-o |
+| CBS deadline miss | `./radar_based_fcw/fcw_consumer --overrun-ms 10` | normal | `Dmiss` lines for `cbs_task` |
+
+Notes:
+- `--burst-ms` replaces the timpani-n wake-up with a local timer, so use it only for the MIT case.
+- Budget exceeded and the CBS deadline miss occur together: an overrun that is throttled also takes
+  longer than the 5 ms deadline.
+- The deadline-miss fault is forwarded to timpani-o only after `max_dmiss` (2) is exceeded; expect a
+  few `Dmiss` counts for `tt_task` right after start-up.
+- The MIT and wakeup-latency anomalies are detected by `libtimpani_rt` and appear only in the
+  consumer log; timpani-n does not read them yet.

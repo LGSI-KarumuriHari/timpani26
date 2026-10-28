@@ -21,4 +21,3 @@ add_library(timpani_rt SHARED
 
 # Add subdirectories
 add_subdirectory(radar_based_fcw)
-add_subdirectory(hello_world)
