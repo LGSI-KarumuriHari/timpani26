@@ -44,8 +44,8 @@ The SHM image is built per unique task. The indices and counters of retained tas
 
 1. If a request is already in progress for the node, it is rejected through the existing failure path. No queue is created.
 2. On the preconfigured isolated CPU set (`0..63`, no duplicates) and on the E and global H of the known confirmed baseline, OConfirmed is copied and the workload set of the test input is reflected. Active tasks present in the confirmed table keep their existing assigned CPU fixed, and new workloads are assigned to unused isolated CPUs first (or, when all are occupied, to the CPU with the least load). The same task identity is not reused for a different task during a test run.
-3. For the TT periods of the whole node, a single node-wide harmonic hyperperiod is computed and applied in common to all isolated-CPU slot placements, and the existing generation and schedulability checks and serialization are performed on the candidate. The candidate is discarded if a single task is distributed across multiple CPUs, a retained task's assigned CPU moves, retained items change under ADD/REMOVE, or conversion or capacity checks fail.
-4. A non-empty unique table ID is assigned. CLEAR also carries E/H/node ID and empty partitions.
+3. For a non-empty candidate, the minimum LCM of the node-wide TT periods is computed and checked to ensure the periods are harmonic and the LCM divides the confirmed execution frame `H`. This minimum repeat cycle does not replace `H`: O retains the baseline `E/H`, expands slots over the same `H`, and preserves retained tasks' repeated slots. The existing generation and schedulability checks and serialization are performed on that fixed-frame candidate. For an empty candidate, the minimum LCM is undefined and the baseline `E/H` is retained. The candidate is discarded if a single task is distributed across multiple CPUs, a retained task's assigned CPU moves, retained items change under ADD/REMOVE, or conversion or capacity checks fail.
+4. A non-empty unique table ID is assigned. Every candidate, including CLEAR, carries the confirmed `E/H` and node ID; CLEAR has empty partitions.
 5. The existing NodeStream sends the full_table, and OAttempt is kept. OConfirmed is not changed by transmission success alone.
 6. `EnforceRecoveryPolicy(RECOVERY_STOP)` resolves the target workload (by identifier or hash) and registers it through the same single-candidate REMOVE path (a table with empty partitions if no workloads remain). It does not send `RecoverySignal`. On a conflict with an in-progress candidate, a nonexistent target, or a validation failure, it returns failure immediately. Once the candidate is registered, it waits, within a finite wait deadline (5 s), for the result of that attempt to settle, and returns success and keeps the session only when removal of the target is confirmed in the confirmed model (up-front rejection, session interruption, or deadline expiry returns failure).
 
@@ -61,7 +61,7 @@ The additional test processes SHALL also be creatable, registrable, and able to 
 | In-progress candidate | While one candidate is being prepared, handed over, or cleaned up, an additional command receives a failure response with no state change |
 | Test scope | Only TT is allowed. CBS, non-TT models, distribution of a single task across multiple CPUs, CPU movement of retained tasks, changes to the baseline E/H, and delta paths are rejected |
 | Retained workload | Preserves the full slot parameters of the active baseline (task, offset/duration/deadline, CPU, current_limit, layer) and the repeat count. Cases that differ only in input order or slot_idx are allowed; changes in task composition are rejected |
-| Values/representation | Positive H; lossless ns conversion of times; overflow in sum and boundary calculations; slot range check within `[0,H)` |
+| Values/representation | Candidate H equals confirmed H; candidate periods form a harmonic set whose minimum LCM divides H; lossless ns conversion of times; overflow in sum and boundary calculations; slot range check within `[0,H)` |
 | Local references | Whether the isolated CPU mask (`0..63`) covers all CPUs in use; uniqueness and liveness of task names/PIDs; consistency between identifiers and hashes |
 | Capacity | Minimum upper bounds of the TT map, task map, and SHM in the actual build. Unique tasks and repeated slot counts are calculated separately |
 
@@ -78,7 +78,7 @@ The two banks, TT slots and TaskMeta (each task's `assigned_cpu` is set to the a
 - The non-RT preparer clears and fills the inactive bank only when it is not used in an RT context and its kernel reference count is 0. If this cannot be confirmed, it does not touch the active state and does not complete preparation.
 - The BPF processing section reads the selector, acquires the corresponding reference, and then rechecks the selector/gate. If it has changed, it does not use that bank's data and returns the reference. On success, the section reads the slots and metadata from the same bank and returns the reference on every exit path.
 - The per-core count of runnable TT tasks (`tt_runnable_count_map`) is managed by 64-bit atomic increments and decrements, and both enqueue and stopping count against the task's assigned CPU.
-- When the TT handover gate is closed, neither a candidate nor a previous TT job is newly run. A woken TT task is kept in an assigned-CPU holding queue that no select/enqueue/dispatch path consumes while the gate is closed; it is not inserted into `SCX_DSQ_LOCAL_ON` or `SCX_DSQ_GLOBAL`. After boundary publication completes and the gate opens, only tasks present in the new active table may be released for TT execution according to that table's slot schedule. Tasks removed by the update are excluded from TT release and handled by the removal cleanup in §8.
+- When the TT handover gate is closed, neither a candidate nor a previous TT job is newly run. A woken TT task is kept in an assigned-CPU holding queue that no select/enqueue/dispatch path consumes while the gate is closed; it is not inserted into `SCX_DSQ_LOCAL_ON` or `SCX_DSQ_GLOBAL`. After boundary publication completes and the gate opens, only tasks present in the new active table may be released for TT execution according to that table's slot schedule. Tasks removed by the update are removed from the holding queue and excluded from TT release; they are cleaned up under §8 without dispatch.
 - The mutable TT fields of the new bank are prepared for the new run, but `tt_runnable/activation_ns` of the active bank is not initialized during preparation. When the runnable state is actually entered, `activation_ns` is recorded, and deadline misses relative to the assigned CPU are judged only for runnable TT jobs. The end of the old run is confirmed only at a TT-free handover in which no task is running.
 - After the boundary handover, once the old timer context and kernel references have ended, the old bank and removal registrations are cleaned up on the non-RT path. The next request is not accepted until cleanup completes.
 
@@ -86,7 +86,7 @@ The memory ordering between reference acquisition, recheck, and cleanup is verif
 
 ## 6. L-P0-04 — Boundary Handover on the Fixed Grid
 
-`H_ns = uint64(hyperperiod_us) * 1000` is computed within the verified range. `T = E + k * H_ns` is selected so that it is later than the candidate preparation time and allows all old TT slots to complete. Inputs that cause overflow in the calculation or cannot produce a valid grid are rejected before activation.
+The received `hyperperiod_us` SHALL represent the confirmed execution frame `H`, unchanged from the baseline. `H_ns = uint64(hyperperiod_us) * 1000` is computed within the verified range. `T = E + k * H_ns` is selected so that it is later than the candidate preparation time and allows all old TT slots to complete. Inputs that change `E/H`, cause overflow, or cannot produce a valid grid are rejected before activation.
 
 | Interval | Owner and action | Invariant condition |
 |:--|:--|:--|
@@ -157,12 +157,12 @@ The test log links the preparation, handover, and actual completion tokens and t
 
 | LLD area | Applicable SRS | HLD / DDR | Tests |
 |:--|:--|:--|:--|
-| L-P0-01 | REQ-RTU-P0-F-001..F-004, REQ-RTU-P0-F-016 | H-P0-01 / D-P0-01, D-P0-02 | TC-P0-01..TC-P0-04, TC-P0-06 |
+| L-P0-01 | REQ-RTU-P0-F-001..F-004, REQ-RTU-P0-F-016 | H-P0-01 / D-P0-01, D-P0-02 | TC-P0-01..TC-P0-04, TC-P0-06, TC-P0-09..TC-P0-10 |
 | L-P0-02, L-P0-03 | REQ-RTU-P0-F-005..F-008, REQ-RTU-P0-N-003 | H-P0-02 / D-P0-03, D-P0-06 | TC-P0-04, TC-P0-06 |
-| L-P0-04 | REQ-RTU-P0-F-009..F-011, REQ-RTU-P0-N-002 | H-P0-03 / D-P0-04 | TC-P0-01, TC-P0-03 |
+| L-P0-04 | REQ-RTU-P0-F-009..F-011, REQ-RTU-P0-N-002 | H-P0-03 / D-P0-04 | TC-P0-01, TC-P0-03, TC-P0-09..TC-P0-10 |
 | L-P0-05 | REQ-RTU-P0-F-012..F-014 | H-P0-04 / D-P0-05 | TC-P0-02, TC-P0-03, TC-P0-05 |
 | L-P0-06 | REQ-RTU-P0-F-015, REQ-RTU-P0-F-016 | H-P0-05 / D-P0-07 | TC-P0-06, TC-P0-07 |
 | L-P0-07 | REQ-RTU-P0-N-001 | H-P0-03 / D-P0-04 | TC-P0-08 |
 | L-P0-08 | REQ-RTU-P0-F-017, REQ-RTU-P0-F-018, REQ-RTU-P0-N-004 | H-P0-05 / D-P0-08 | TC-P0-07, TC-P0-08 |
 
-The tests above are linked to [SRS TC-P0-01..08](SRS-011-runtime-table-update.md) and [REQ AC-P0-01..08](REQ-011-runtime-table-update.md). No work numbers for Phase 1/2 requirements or implementation plans are created.
+The tests above are linked to [SRS TC-P0-01..10](SRS-011-runtime-table-update.md) and [REQ AC-P0-01..08](REQ-011-runtime-table-update.md). No work numbers for Phase 1/2 requirements or implementation plans are created.
