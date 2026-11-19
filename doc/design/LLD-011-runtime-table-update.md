@@ -55,13 +55,16 @@ The additional test processes SHALL also be creatable, registrable, and able to 
 
 ## 4. L-P0-02 — N Pre-Checks and Rejection
 
+The existing wire representation carries the execution frame and expanded `TtSlot` timing fields, not the original TT task periods. Candidate-period harmonicity and minimum-LCM validation therefore remain O's responsibility in §3; N does not infer or revalidate them from the received slots.
+
 | Check item | Handling |
 |:--|:--|
 | Receive context | Confirms the currently authorized connection, the target node ID, and a non-empty table ID |
 | In-progress candidate | While one candidate is being prepared, handed over, or cleaned up, an additional command receives a failure response with no state change |
 | Test scope | Only TT is allowed. CBS, non-TT models, distribution of a single task across multiple CPUs, CPU movement of retained tasks, changes to the baseline E/H, and delta paths are rejected |
 | Retained workload | Preserves the full slot parameters of the active baseline (task, offset/duration/deadline, CPU, current_limit, layer) and the repeat count. Cases that differ only in input order or slot_idx are allowed; changes in task composition are rejected |
-| Values/representation | Candidate H equals confirmed H; candidate periods form a harmonic set whose minimum LCM divides H; lossless ns conversion of times; overflow in sum and boundary calculations; slot range check within `[0,H)` |
+| Time grid | Received `E/H` equals the confirmed baseline. N checks the epoch and execution-frame values; it does not derive candidate periods or repeat the harmonic/minimum-LCM check performed by O in §3 |
+| Values/representation | Lossless conversion of received slot offsets, durations, and deadlines to internal units; overflow checks in sums and boundary calculations; slot offsets and occupied intervals are representable and within `[0,H)` |
 | Local references | Whether the isolated CPU mask (`0..63`) covers all CPUs in use; uniqueness and liveness of task names/PIDs; consistency between identifiers and hashes |
 | Capacity | Minimum upper bounds of the TT map, task map, and SHM in the actual build. Unique tasks and repeated slot counts are calculated separately |
 
