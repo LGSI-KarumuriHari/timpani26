@@ -9,7 +9,7 @@
 #define TIMPANI_TT_COMPLETE_BITSET 0x5444434dU
 
 struct timpani_tt_completion {
-    unsigned long long deadline_ns;
+    unsigned long long deadline_ns; /* CLOCK_TAI */
 };
 
 #endif

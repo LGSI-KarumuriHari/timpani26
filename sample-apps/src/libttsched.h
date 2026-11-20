@@ -26,7 +26,7 @@ struct timpani_task_slot {
 struct timpani_tt_release {
     uint32_t version;
     uint32_t counter;
-    uint64_t deadline_ns;
+    uint64_t deadline_ns; /* planned absolute deadline, CLOCK_TAI */
 };
 
 /**

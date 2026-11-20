@@ -450,7 +450,7 @@ int BPF_PROG(tt_job_complete, u32* uaddr, unsigned int flags, int nr_wake,
         return 0;
 
     struct timpani_tt_completion completion;
-    __u64 now = bpf_ktime_get_ns();
+    __u64 now = bpf_ktime_get_tai_ns();
     if (bpf_probe_read_user(&completion, sizeof(completion), uaddr) ||
         !completion.deadline_ns || now <= completion.deadline_ns)
         return 0;

@@ -52,6 +52,11 @@ expired deadlines independently of completion is tracked in
 [#59](https://github.com/eclipse-timpani/timpani26/issues/59), which will also
 replace the internal completion marker used by this release.
 
+TT deadlines and completion times use `CLOCK_TAI`, so they stay comparable
+across nodes once PTP sets the kernel TAI offset. With NTP only, the offset is
+usually 0 and `CLOCK_TAI` equals `CLOCK_REALTIME`. Applications do not need to
+read `CLOCK_TAI`; use `CLOCK_MONOTONIC` for their own timeouts and durations.
+
 Deploy `timpani-n` and `libttsched` from the same release. For dynamically linked
 apps, replace `libttsched.so` and restart the app; recompiling the app is not
 required. Rebuild and redeploy apps that include `libttsched` statically. Rebuild
