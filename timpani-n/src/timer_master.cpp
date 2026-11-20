@@ -323,6 +323,7 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
 
     std::vector<long long> jitters;
     jitters.reserve(1500);
+    uint64_t wide_clock_pairs = 0;
 
     /* Sort per-CPU slots by offset_ns ascending */
     std::sort(cpu_slots.begin(), cpu_slots.end(),
@@ -383,22 +384,37 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
 
             clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &next_ts, nullptr);
 
-            struct timespec mono_before_ts;
-            clock_gettime(CLOCK_MONOTONIC, &mono_before_ts);
-            struct timespec wakeup_ts;
-            clock_gettime(CLOCK_REALTIME, &wakeup_ts);
-            struct timespec mono_ts;
-            clock_gettime(CLOCK_MONOTONIC, &mono_ts);
+            /* Preemption between reads skews the REALTIME->MONOTONIC conversion
+             * by half the gap, so keep the narrowest of a few bounded tries. */
+            constexpr uint64_t kMaxClockPairNs = 20000;
+            constexpr int kClockPairTries = 3;
+            struct timespec wakeup_ts {};
+            uint64_t now_mono_ns = 0;
+            uint64_t pair_gap_ns = UINT64_MAX;
+            uint64_t paired_mono_ns = 0;
+            for (int attempt = 0; attempt < kClockPairTries; ++attempt) {
+                struct timespec before_ts, rt_ts, after_ts;
+                clock_gettime(CLOCK_MONOTONIC, &before_ts);
+                clock_gettime(CLOCK_REALTIME, &rt_ts);
+                clock_gettime(CLOCK_MONOTONIC, &after_ts);
+                const uint64_t before_ns =
+                    (uint64_t)before_ts.tv_sec * 1000000000ULL + before_ts.tv_nsec;
+                const uint64_t after_ns =
+                    (uint64_t)after_ts.tv_sec * 1000000000ULL + after_ts.tv_nsec;
+                if (after_ns - before_ns < pair_gap_ns) {
+                    pair_gap_ns = after_ns - before_ns;
+                    paired_mono_ns = before_ns + pair_gap_ns / 2;
+                    wakeup_ts = rt_ts;
+                }
+                now_mono_ns = after_ns;
+                if (pair_gap_ns <= kMaxClockPairNs) break;
+            }
+            if (pair_gap_ns > kMaxClockPairNs) ++wide_clock_pairs;
 
             long long actual_ns =
                 (long long)wakeup_ts.tv_sec * 1000000000LL + wakeup_ts.tv_nsec;
             long long jitter = actual_ns - (long long)target_ns;
 
-            uint64_t now_mono_ns =
-                (uint64_t)mono_ts.tv_sec * 1000000000ULL + mono_ts.tv_nsec;
-            uint64_t before_mono_ns =
-                (uint64_t)mono_before_ts.tv_sec * 1000000000ULL + mono_before_ts.tv_nsec;
-            const uint64_t paired_mono_ns = before_mono_ns + (now_mono_ns - before_mono_ns) / 2;
             const int64_t planned_deadline_ns = static_cast<int64_t>(paired_mono_ns) -
                                                jitter + slot.deadline_us * 1000LL;
 
@@ -433,6 +449,9 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
                 std::cout << "  Avg: " << sum / 1000 << " ns" << std::endl;
                 std::cout << "  P99: " << jitters[990] << " ns" << std::endl;
                 std::cout << "  P999: " << jitters[999] << " ns" << std::endl;
+                std::cout << "  Clock pairs over 20 us after retries: "
+                          << wide_clock_pairs << std::endl;
+                wide_clock_pairs = 0;
 
                 std::cout << "\n[CPU" << cpu
                           << "] Histogram (10us buckets, absolute jitter):"
