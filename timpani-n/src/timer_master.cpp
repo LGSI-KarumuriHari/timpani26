@@ -383,19 +383,26 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
 
             clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &next_ts, nullptr);
 
+            struct timespec mono_before_ts;
+            clock_gettime(CLOCK_MONOTONIC, &mono_before_ts);
             struct timespec wakeup_ts;
             clock_gettime(CLOCK_REALTIME, &wakeup_ts);
+            struct timespec mono_ts;
+            clock_gettime(CLOCK_MONOTONIC, &mono_ts);
 
             long long actual_ns =
                 (long long)wakeup_ts.tv_sec * 1000000000LL + wakeup_ts.tv_nsec;
             long long jitter = actual_ns - (long long)target_ns;
 
-            bpf_loader_.update_current_slot(slot.cpu, slot.slot_idx);
-
-            struct timespec mono_ts;
-            clock_gettime(CLOCK_MONOTONIC, &mono_ts);
             uint64_t now_mono_ns =
                 (uint64_t)mono_ts.tv_sec * 1000000000ULL + mono_ts.tv_nsec;
+            uint64_t before_mono_ns =
+                (uint64_t)mono_before_ts.tv_sec * 1000000000ULL + mono_before_ts.tv_nsec;
+            const uint64_t paired_mono_ns = before_mono_ns + (now_mono_ns - before_mono_ns) / 2;
+            const int64_t planned_deadline_ns = static_cast<int64_t>(paired_mono_ns) -
+                                               jitter + slot.deadline_us * 1000LL;
+
+            bpf_loader_.update_current_slot(slot.cpu, slot.slot_idx);
             uint64_t next_tt_realtime_ns = compute_next_tt_start_for_cpu(
                 cpu_slots, next_slot_idx, current_hyperperiod_start,
                 hyperperiod_ns);
@@ -453,7 +460,7 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
                 jitters.reserve(1500);
             }
 
-            wake_task(slot.task_id_hash);
+            wake_task(slot.task_id_hash, planned_deadline_ns > 0 ? planned_deadline_ns : 1);
 
             next_slot_idx++;
             if (next_slot_idx >= cpu_slots.size()) {
@@ -466,7 +473,7 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
     std::cout << "[TimerMaster:CPU" << cpu << "] Thread exiting" << std::endl;
 }
 
-void TimerMaster::wake_task(uint64_t task_id_hash)
+void TimerMaster::wake_task(uint64_t task_id_hash, uint64_t deadline_ns)
 {
     if (!ttsched_shm_) return;
 
@@ -478,10 +485,15 @@ void TimerMaster::wake_task(uint64_t task_id_hash)
     if (it == task_hash_to_shm_idx_.end()) return;
 
     int idx = it->second;
-    /* Increment per-task counter and wake exactly 1 waiter */
-    __atomic_fetch_add(const_cast<uint32_t*>(&ttsched_shm_->tasks[idx].counter),
-                       1u, __ATOMIC_SEQ_CST);
-    syscall(SYS_futex, const_cast<uint32_t*>(&ttsched_shm_->tasks[idx].counter),
+    auto& release = ttsched_shm_->releases[idx];
+    auto* counter = &ttsched_shm_->tasks[idx].counter;
+    const uint32_t next_counter = __atomic_load_n(counter, __ATOMIC_RELAXED) + 1u;
+    __atomic_fetch_add(&release.version, 1u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release.counter, next_counter, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release.deadline_ns, deadline_ns, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&release.version, 1u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(counter, next_counter, __ATOMIC_RELEASE);
+    syscall(SYS_futex, const_cast<uint32_t*>(counter),
             FUTEX_WAKE, 1, /* wake only the ONE task waiting on this counter */
             nullptr, nullptr, 0);
 }
