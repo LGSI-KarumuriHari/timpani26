@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/timex.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -381,21 +382,20 @@ void TimerMaster::cpu_thread_loop(uint32_t cpu,
             next_ts.tv_sec = target_ns / 1000000000ULL;
             next_ts.tv_nsec = target_ns % 1000000000ULL;
 
+            /* Kernel TAI - UTC seconds; read before sleeping to keep it off the release path. */
+            struct timex tx = {};
+            adjtimex(&tx);
+            const long long tai_offset_ns = tx.tai * 1000000000LL;
+
             clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &next_ts, nullptr);
 
-            struct timespec wakeup_ts, tai_ts;
+            struct timespec wakeup_ts;
             clock_gettime(CLOCK_REALTIME, &wakeup_ts);
-            clock_gettime(CLOCK_TAI, &tai_ts);
 
             long long actual_ns =
                 (long long)wakeup_ts.tv_sec * 1000000000LL + wakeup_ts.tv_nsec;
             long long jitter = actual_ns - (long long)target_ns;
 
-            /* TAI = REALTIME + whole seconds; rounding makes read skew irrelevant. */
-            const long long tai_offset_ns =
-                ((tai_ts.tv_sec - wakeup_ts.tv_sec) * 1000000000LL +
-                 (tai_ts.tv_nsec - wakeup_ts.tv_nsec) + 500000000LL) /
-                1000000000LL * 1000000000LL;
             const int64_t planned_deadline_ns = static_cast<int64_t>(target_ns) +
                                                tai_offset_ns +
                                                slot.deadline_us * 1000LL;
