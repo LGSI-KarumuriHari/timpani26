@@ -3,504 +3,113 @@ SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
 SPDX-License-Identifier: MIT
 -->
 
-# DDR-011: 무중단 Schedule Table 갱신
+# DDR-011: Runtime Table Update — Phase 0 설계 결정
 
-**작성일:** 2026-06-15
-**상태:** Draft
-**작성자:** Human (Lead Architect) + AI
-**관련 문서:** DDR-005 (BPF 스케줄러), DDR-006 (통신 아키텍처)
+**작성일:** 2026-10-28  
+**상태:** Draft — Phase 0 설계 제안, PL 검토 대상  
+**상위 기준:** [REQ-011](../kor/REQ-011-runtime-table-update.md), [SRS-011](SRS-011-runtime-table-update.md)  
+**연계 설계:** [HLD-011](HLD-011-runtime-table-update.md), [LLD-011](LLD-011-runtime-table-update.md)
 
----
+## 1. 결정 범위
 
-## 1. 개요
+단일 노드·사전 지정된 하나 이상의 격리 CPU(유지 태스크 코어 고정)·L1 TT·고정 시간 격자에서 네 가지 정상 갱신을 확인하는 데 필요한 결정만 기록한다. 기존 전체 기능 DDR의 승인 이력이나 결정 번호를 대체하지 않는다. 이 폴더의 결정은 `D-P0-##`로 식별한다. 아래 채택은 문서 설계안의 채택이며 구현·하드웨어 검증·인터페이스 변경 승인을 뜻하지 않는다.
 
-본 문서는 TIMPANI의 **무중단 Schedule Table 갱신** 메커니즘을 기술한다. 목표는 어떠한 데몬도 재시작하지 않고, 다른 실행 중인 워크로드에 영향을 주지 않으면서 워크로드를 추가, 제거, 수정하는 것이다.
+## 2. D-P0-01 — 기존 Full Snapshot 한 경로
 
-### 설계 목표
+**결정:** REPLACE/ADD/REMOVE(복구 STOP 포함)/CLEAR 모두 기존 `ControlCommand.full_table`을 사용한다. ADD/REMOVE는 의미론적 결과이며 별도 델타 메시지가 아니다. Phase 0의 복구 STOP은 소유 노드에 대체 `full_table`만 전송하며 `RecoverySignal` 브로드캐스트나 노드 측 제거 테이블 합성을 사용하지 않는다. 빈 `partitions`도 양수 H와 동일 E를 가진 유효 테이블이다. `ControlCommand.update`는 Phase 0 경로에서 상태 변경 없이 거절한다.
 
-| 목표 | 설명 |
+**이유:** 기존 O→N 전송을 재사용하고 델타 병합·기준 revision 프로토콜을 만들지 않으면서 원문의 네 가지 결과를 확인할 수 있다. 연산 종류와 대상은 O의 요청 문맥/시험 로그에 보관하며 proto 필드를 추가하지 않는다.
+
+**비채택:** 델타 병행, 신규 RPC, 다중 노드 트랜잭션.
+
+**추적:** REQ-RTU-P0-F-001, REQ-RTU-P0-F-004. REQ OI-01.
+
+## 3. D-P0-02 — O 입력·복구 STOP과 한 건 확정
+
+**결정:** 단일 노드의 사전 지정된 격리 CPU 집합(`0..63`) 위에서 기존 O 생성 경로에 워크로드 집합 변경을 연결한다. `confirmed`와 한 개의 `candidate`를 분리하고 한 건 진행 중 추가 요청은 거절한다. 확정 노드 전역 실행 프레임 `H`와 epoch `E`는 CLEAR를 포함한 Phase 0 내내 고정한다. 비어 있지 않은 후보마다 TT 주기의 최소 LCM을 산출하여 주기가 harmonic 집합이고 최소 LCM이 `H`를 나누는지 확인한 뒤 슬롯을 동일 `H` 전체에 확장한다. 이 최소 반복 주기는 실행 프레임을 대체하지 않는다. 유지 태스크의 반복 슬롯과 기존 배정 CPU를 보존하고 신규 워크로드만 미사용 격리 CPU 우선(부족 시 최소 부하 CPU)으로 배정한다. 단일 태스크의 다중 CPU 분산이나 유지 태스크의 CPU 이동은 거절한다(코어 간 이동은 Phase 1). 후보는 생성 검증·스케줄 가능성 판단·유지 파라미터 보존 확인 후 전송하고, 일치하는 성공 ACK 후 확정한다.
+
+복구 제거는 기존 `EnforceRecoveryPolicy(RECOVERY_STOP)`를, 일반 REMOVE/CLEAR/REPLACE 시험은 O 내부 시험 접점을 사용하며 정상 배포 해제용 신규 RPC는 추가하지 않는다. `RECOVERY_STOP`도 동일한 후보 제거 경로(마지막 워크로드 제거 시 빈 테이블)와 단일 in-flight 거절 규칙을 따르되, 호출자가 노드 런타임 정리 완료 후에만 워크로드를 종료할 수 있도록 유한 대기 기한 내에서 상관된 `TableApplied` 성공 확인 후 완료를 반환하고 세션을 유지한다(사전 거절·진행 중 충돌·미확인 시 실패 반환, 반복 STOP의 무해 수렴은 비포함). `table_id`는 시험 회차에서 유일한 기존 문자열을 사용하며 영속 incarnation·재전송 버전 대수를 설계하지 않는다.
+
+**이유:** 검증 실패로 기존 모델을 훼손하지 않고 복구 STOP을 포함한 O 생성→N 실행을 단일 경로로 확인하는 데 충분하다. N에 손으로 만든 테이블만 주입하는 시험은 보조 단위 시험으로만 사용한다.
+
+**추적:** REQ-RTU-P0-F-002..F-004, REQ-RTU-P0-F-007, REQ-RTU-P0-F-016. REQ OI-17.
+
+## 4. D-P0-03 — 비활성 TT 설정과 실제 커널 선택
+
+**결정:** TT 슬롯과 태스크 메타데이터(`assigned_cpu`는 각 태스크 레코드의 배정 CPU로 기록)를 비활성/활성 두 뱅크로 준비하고 같은 선택자를 사용한다. 비활성 쓰기는 현재 실행에 보이지 않아야 하며 BPF는 각 처리 구간에서 한 뱅크를 일관되게 사용해야 한다. 코어별 실행 가능 TT 태스크 카운트는 64비트 원자적 증감으로 유지한다. 인계 게이트가 닫힌 동안 깨어난 TT 태스크는 select/enqueue/dispatch 경로가 소비하지 않는 배정 CPU holding queue에 보관하고 `SCX_DSQ_LOCAL_ON` 또는 `SCX_DSQ_GLOBAL`에 넣지 않는다. 경계 게시 완료 후 게이트가 열리면 새 활성 테이블에 있는 태스크만 예정 슬롯에 따라 해제한다. 새 테이블에서 제외된 태스크는 holding queue에서 제거·정리하며 디스패치하지 않는다. 태스크 메타데이터의 실행 중 가변 값은 후보 준비 때문에 활성 뱅크에서 초기화하지 않는다.
+
+현재 `BpfLoader::swap_shadow_maps()`의 사용자 인덱스 토글과 `apply_table_update()`의 TODO는 실제 전환으로 인정하지 않는다. 기존 공개 메서드 이름/시그니처를 보존하면서 내부 기록 경로와 BPF 조회 경로를 함께 변경해야 한다. CBS 맵·복구 맵·전체 스케줄러 재적재는 이 결정의 범위가 아니다.
+
+구 뱅크는 BPF의 참조와 구 타이머 컨텍스트 사용이 끝난 뒤에만 비RT 경로에서 정리·재사용한다. 제한된 뱅크별 참조 기록과 인계 확인을 사용하며 RT에서 해제나 대기를 수행하지 않는다. 완료 확인 전 다음 후보는 수락하지 않는다.
+
+**이유:** 활성 맵을 지우고 차례대로 채우는 방법으로는 정상 경로에서도 혼합 테이블과 사전 거절의 무부작용을 보장할 수 없다. 설정 선택과 수명 규칙은 기본 원자성에 필요한 최소 동기화이다.
+
+**비채택:** 단일 live 맵 in-place 갱신, C++ 인덱스만 변경, CBS 런타임 상태 이중화, 일반화된 설정 세트 은퇴 프레임워크.
+
+**추적:** REQ-RTU-P0-F-005, REQ-RTU-P0-F-006, REQ-RTU-P0-F-008. REQ OI-05.
+
+## 5. D-P0-04 — 상주 타이머와 TT-free 인계
+
+**결정:** 고정 E/전역 H와 사전 지정된 격리 CPU 집합에서 단일 상주 RT 타이머를 유지한다. 각 슬롯의 차기 발화 시각은 동일 CPU의 다음 슬롯 시각으로 계산한다. 후보 슬롯·SHM 이미지·제어 값은 비RT 경로에서 준비하고, 모든 격리 CPU에서 마지막 구 TT 슬롯이 완료된 뒤의 공통 TT-free 구간에서 인계한다. 활성·후보 테이블에 관여하는 모든 격리 CPU에 구 실행이 남지 않았음을 확인한 뒤 TT 디스패치를 닫고 새 커널 설정 선택과 관여 CPU별 슬롯 상태 초기화를 수행하되 효력은 미래 경계 T까지 열지 않는다.
+
+경계의 RT 처리는 미리 준비된 컨텍스트 선택·게시 유효화·실행 허용의 고정 개수 atomic 연산 및 기존 슬롯 발화로 한정한다. 커널 제어 값은 로드 시 준비한 공유 제어 영역에서 접근하고 경계 전환 때문에 `bpf_map_update_elem`, 스레드 생성/join, 동적 할당, 파일/네트워크 I/O를 RT 경로에 추가하지 않는다. 공유 제어 영역의 정렬·메모리 순서·커널 가시성은 target 시험에서 확인한다.
+
+준비가 인계 시작 전에 늦으면 다음 `E+kH`를 선택한다. 인계 시작 후 실패는 자동 복원 대상이 아니라 Phase 0 시험 실패이다. TT-free 구간의 길이는 시험 구성에 기록하지만 최악 적용 지연/커밋 창 SLA로 보증하지 않는다. CLEAR에서도 E/H와 상주 제어 경로를 유지한다.
+
+**이유:** 갱신 때 stop/start하면 진행 슬롯 절단과 불필요한 스레드 수명 처리가 생긴다. 유지 태스크의 배정 CPU를 고정하고 노드 전역 H를 공유하면 새 코어별 타이머 풀·멀티스레드 배리어 없이 단일 상주 타이머와 고정 경계만으로 다중 격리 CPU 전환을 수행할 수 있다.
+
+**추적:** REQ-RTU-P0-F-009..F-011, REQ-RTU-P0-N-001, REQ-RTU-P0-N-002. REQ OI-05.
+
+## 6. D-P0-05 — 기존 SHM 레이아웃의 유효 게시와 잡 wake 분리
+
+**결정:** [기존 SHM 헤더](../../../sample-apps/src/libttsched.h)의 구조체·크기·magic·반환값을 유지한다. `generation`은 단조 증가하는 게시 순서로 사용하고, 홀수는 게시 중, 짝수는 안정 상태로 해석한다. 작성 시작에 홀수로 전환한 뒤 데이터를 기록하고 경계 T에 짝수 세대와 magic을 release 순서로 유효화한다. 소비자는 acquire 읽기와 전후 세대 비교로 게시 중/변경된 스냅샷을 버린다.
+
+유지 태스크의 인덱스와 잡 카운터를 보존한다. 게시 때문에 전체 태스크의 counter를 증가시키지 않으며 실제 슬롯 발화만 증가시킨다. 소비자는 futex 반환만으로 성공을 반환하지 않고 유효성·세대·태스크 신원과 실제 counter 변화를 확인한다. 제거/슬롯 재사용으로 다른 태스크가 깨운 경우에는 잡을 실행하지 않는다.
+
+읽기 불가 시 기존 `-1` 계약과 제한된 재확인을 사용하며 busy-spin하지 않는다. 무효 지속은 시험기 한계에서 시험 중단으로 기록한다. 제거 즉시 wake의 보장·상한 및 첫 잡 무손실의 정량 검증은 Phase 1로 이관한다.
+
+**조건:** 시험에는 이 게시 규칙을 함께 구현한 N과 libttsched를 사용한다. 구 소비자 바이너리의 새 동작 충족을 주장하지 않는다. 레이아웃/공개 API 변경은 하지 않으며, 구현 검토에서 기존 인터페이스 계약의 파괴적 변경이 필요하다고 판명되면 별도 승인 전 진행하지 않는다. 초기 게시도 안정된 짝수 세대로 만들고, 세대 wrap이 필요한 시험 입력은 수락하지 않는다.
+
+**이유:** magic-last만으로 대기 후 제어 wake 오인이나 쓰기와 겹친 조회의 일관성을 모두 보장하지 못한다. 기존 세대 필드와 카운터를 이용하면 신규 SHM ABI 없이 두 사건을 구분할 수 있다.
+
+**추적:** REQ-RTU-P0-F-012..F-014. REQ OI-06.
+
+## 7. D-P0-06 — 현재 표현·용량 안에서 거절
+
+**결정:** proto 스키마는 변경하지 않는다. N은 무손실 변환·고정 시험 조건과 로컬 참조만 확인하며 스케줄 가능성을 재계산하지 않는다.
+
+| 표현 | Phase 0 기준 |
 |:--|:--|
-| **무중단** | 프로세스 재시작 없이 워크로드 변경 적용 |
-| **결정론** | Hyperperiod 경계에서만 테이블 교체 |
-| **격리** | 한 워크로드의 변경이 다른 워크로드에 영향 없음 (FFI) |
-| **원자성** | 갱신은 hyperperiod 경계에서만 적용됨; userspace↔BPF↔app 경계 간 일관성은 in-place map upsert + SHM generation 핸드셰이크(magic-last publish)로 보장 |
+| 시간 | proto의 `uint32 hyperperiod_us`와 슬롯 us 값, `uint64 epoch_ns` 사용. ns 변환·경계 계산은 overflow를 확인하고 H/E 변경은 거절 |
+| TT 슬롯 | 현재 BPF 맵의 뱅크당 2048 항목 이내. 이중화로 논리 용량이 늘어났다고 해석하지 않음 |
+| 태스크 | 현재 BPF 태스크 맵 4096과 SHM `TIMPANI_MAX_TASKS=32` 중 작은 값인 **고유 TT 태스크 32개 이내** |
+| CPU | 64비트 마스크 범위(`0..63`) 안의 사전 지정된 격리 CPU 집합과 일치. 각 태스크는 단일 격리 CPU에만 속하며 유지되는 활성 태스크의 배정 CPU 변경(코어 간 이동)은 거절 |
+| 태스크 참조 | 기존 PID 해석 경로를 사용하되 시험 이름은 고유한 ASCII 1~15바이트로 제한. 이름 잘림·PID 중복 해석·서로 다른 식별자의 해시 충돌은 거절 |
 
-### 1.1 Zero-Downtime 달성 방식 (구현됨 — Phase 2)
+실제 빌드 상수가 달라지면 시험 기록과 유효 최소 용량도 함께 확인한다. 하드코딩한 문서 숫자만 믿고 더 작은 실제 한계를 넘겨서는 안 된다. 슬롯 시간의 테이블 범위 포함 확인은 표현 확인이고 슬롯 간 충돌 분석은 아니다.
 
-`timpani26` 기준으로, zero-downtime 갱신은 BPF-map double buffer가 아니라 **userspace에서** 수행됩니다:
+**추적:** REQ-RTU-P0-F-003, REQ-RTU-P0-F-005, REQ-RTU-P0-N-003. REQ OI-12, OI-15.
 
-- **per-CPU 타이머 스레드**: TIMPANI-N은 격리 CPU마다 타이머 스레드 1개(`TimerMaster::cpu_thread_loop`)를 두고, 각 스레드는 공유 `epoch_ns` hyperperiod 격자 위에서 자기 CPU의 TT 슬롯만 발화합니다. 이는 여러 CPU에서 같은 시각에 예약된 슬롯을 제대로 발화하지 못하던 기존 단일 스레드 마스터를 대체한 것입니다(`46a301d`).
-- **in-place BPF map upsert**: `set_schedule_table()` / `remove_workload()`가 타이머 스레드를 재구성하고 live BPF map(`tt_table_map`, `current_slot_map`, `cbs_map`)을 직접 upsert합니다. 활성 테이블은 두 개가 아니라 하나입니다.
-- **SHM generation 핸드셰이크**: 타이머 마스터가 앱 공유 SHM의 `generation` 카운터를 증가시키고 `magic`을 마지막에 써서, `libttsched` 클라이언트가 변경 시 자기 task 슬롯을 재조회하도록 강제합니다(`8369e01`). 기존 task의 SHM slot 인덱스는 wakeup 왜곡을 막기 위해 안정적으로 유지되며(`42f12f5`), 멀티스레드 앱을 위해 스레드별 SHM 상태는 thread-local입니다(`bf8ba5c`).
-- **결정성**: 변경은 다음 hyperperiod 경계에서 적용됩니다. 늦게 시작한 경우(`epoch_ns`가 이미 과거)에는 동일 전역 격자의 다음 경계로 catch-up합니다.
+## 8. D-P0-07 — 적용 후 ACK와 정상 제거
 
-> **참고**: BPF-map **double buffering**(`active_map_idx`, §2)은 BPF 테이블 map을 통째로 원자적으로 교체해야 하는 상황을 위한 *예비(deferred)* 메커니즘입니다. 아직 **미구현**이며(Open Item B-2.1), 위 증분 갱신 경로에서는 사용되지 않습니다.
+**결정:** 기존 `TableApplied(table_id, success, error)`를 사용한다. 실제 경계 적용과 제거 참조 정리 후 성공을 보고한다. 사전 거절은 활성 상태 불변을 확인하고 실패 사유를 보낸다. 전환 도중 실패에는 성공이나 이전 상태 보존을 주장하지 않는다.
 
-> **SHM 레이아웃 변경**(`8369e01`, breaking): `timpani_ttsched_shm`에 `generation` 필드가 추가되고 `tasks[]` 배열 오프셋이 byte 8 → 16으로 이동했습니다. `libttsched.h` 사용처(timpani-n, sample-apps, 외부 TT 워크로드)는 재컴파일이 필요합니다.
+제거 시 TT 맵·메타데이터·등록/추적 참조·SHM 항목을 정리하되 OS policy/affinity를 바꾸거나 복원하지 않는다. 컨테이너 종료는 TIMPANI 범위 밖이며 복구 STOP에서는 O의 완료 응답 이후 상위 오케스트레이터가 수행한다. 다음 요청은 정리 및 O의 현재 요청 결과 처리가 끝난 뒤 수락한다.
 
----
+**비채택:** 신규 결과 코드 스키마, RESTORE_FAILED 상태 기계, 운영용 미확인 상태 전이, 자동 재전송/재동기화.
 
-## 2. Double Buffering 아키텍처 (Deferred — 미구현)
+**추적:** REQ-RTU-P0-F-011, REQ-RTU-P0-F-014..F-016.
 
-> **상태**: 이 섹션은 `timpani26`에 **미구현**인 **계획된** 메커니즘을 기술합니다(Open Item B-2.1). 아래의 `tt_table_map_0` / `tt_table_map_1` 및 `active_map_idx`는 현재 소스에 **존재하지 않습니다** — 단일 `tt_table_map`이 있으며, `ops.dispatch()`는 (per-CPU 타이머 스레드가 몰아주는, §1.1) `current_slot_map`으로 활성 슬롯을 선택합니다. Double buffering은 BPF 테이블 map을 **통째로 원자적으로 교체**해야 하는 미래 상황을 위한 예비이며, 출시된 증분 갱신 경로(§1.1, §4)에는 필요하지 않습니다.
+## 9. D-P0-08 — 시험 로그와 검증 수준 분리
 
-### 2.1 개념
+**결정:** 기존 O/N 로그와 시험 결과 파일을 사용한다. 계획 경계와 실제 완료 시각, 커널 선택/세대/실행 증거를 같은 table ID로 연결한다. host 단위 시험과 목표 Linux 하드웨어의 실제 TT/BPF/app 시험을 별도 결과로 기록한다.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  BPF Map Double Buffer 구조                                 │
-│                                                             │
-│  ┌──────────────────┐    ┌──────────────────┐              │
-│  │  tt_table_map[0] │    │  tt_table_map[1] │              │
-│  │  (Shadow)        │    │  (Active)        │              │
-│  └──────────────────┘    └──────────────────┘              │
-│           ↑                       ↑                        │
-│      다음 테이블 준비          현재 실행 중                  │
-│                                                             │
-│  active_map_idx = 1  (현재 Active는 [1])                   │
-│                                                             │
-│  Hyperperiod 경계에서:                                      │
-│    active_map_idx = 0  (Atomic swap → [0]이 Active가 됨)    │
-└─────────────────────────────────────────────────────────────┘
-```
+시험기의 유한 대기 한계와 복구 STOP 응답의 유한 ACK 대기 기한은 호출 결과 판정·시험 종료를 위한 값이며 운영용 ACK 복구나 타이밍 SLA가 아니다. 전제 이탈 시 시험을 중단하고 후속 요청을 보내지 않는다. 기존 안전장치는 유지하지만 Phase 0의 결과를 실차/안전 운용 승인으로 사용하지 않는다.
 
-### 2.2 BPF Map 정의
+**추적:** REQ-RTU-P0-F-017, REQ-RTU-P0-F-018, REQ-RTU-P0-N-004. REQ OI-10.
 
-```c
-/* B-2.1: Shadow map 인덱스 관리 */
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, u32);  // 0 또는 1
-} active_map_idx SEC(".maps");
+## 10. 이관과 검토 게이트
 
-/* Double buffer: 2개의 tt_table_map */
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_TT_SLOTS);
-    __type(key, struct TtSlotKey);
-    __type(value, struct TtSlotBpf);
-} tt_table_map_0 SEC(".maps");  // Shadow 또는 Active
+Phase 1은 CBS·MODIFY·시간 격자 및 격리 CPU 구성 변경·활성 태스크의 코어 간 이동·요청 관리(보류/반복 STOP 정책 포함)·코어별 타이머 확장/다중 노드·정량 품질·세부 앱 호환성을, Phase 2는 롤백·복원 실패·미확인/단절 복구·STOP 실패 시 재디스패치 차단 및 기준선 재동기화·시계/결함 관리를 다룬다. 이들의 훅이나 세부 상태 기계를 Phase 0에 선행 구현하지 않는다.
 
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_TT_SLOTS);
-    __type(key, struct TtSlotKey);
-    __type(value, struct TtSlotBpf);
-} tt_table_map_1 SEC(".maps");  // Active 또는 Shadow
-
-/* 지원 자료구조 */
-struct TtSlotKey {
-    u32 cpu;
-    u32 slot_idx;
-};
-
-struct TtSlotBpf {
-    u64 workload_id_hash;
-    u64 task_id_hash;
-    u32 offset_us;
-    u32 duration_us;
-    u32 deadline_us;
-    u32 cpu;
-};
-```
-
-### 2.3 ops.dispatch() 구현
-
-```c
-void BPF_STRUCT_OPS(timpani_dispatch, s32 cpu, struct task_struct *prev)
-{
-    /* active map index 읽기 (atomic read) */
-    u32 key = 0;
-    u32 *active = bpf_map_lookup_elem(&active_map_idx, &key);
-    u32 idx = active ? *active : 0;
-
-    /* active table에서 현재 slot 조회 */
-    u32 *slot_idx = bpf_map_lookup_elem(&current_slot_map, &cpu);
-    if (!slot_idx || *slot_idx == SLOT_NONE)
-        goto fallback;
-
-    struct TtSlotKey slot_key = { .cpu = cpu, .slot_idx = *slot_idx };
-    struct TtSlotBpf *slot;
-
-    /* 인덱스에 따라 active map 참조 */
-    if (idx == 0)
-        slot = bpf_map_lookup_elem(&tt_table_map_0, &slot_key);
-    else
-        slot = bpf_map_lookup_elem(&tt_table_map_1, &slot_key);
-
-    if (slot) {
-        /* L1 TT 태스크를 대기 큐에서 dispatch */
-        scx_bpf_consume(slot->task_id_hash);
-        return;
-    }
-
-fallback:
-    /* L2 CBS → L3/L4 BE */
-    if (scx_bpf_consume(DSQ_CBS))
-        return;
-    scx_bpf_consume(DSQ_BE);
-}
-```
-
----
-
-## 3. 갱신 시나리오
-
-### 3.1 워크로드 추가 (독립적)
-
-**트리거:** Pullpiri가 `RegisterWorkload` 요청 전송
-
-```
-시간축 →
-                    Hyperperiod = 100ms
-├────────────────────────────────────────────────────────────┤
-│  Slot 0      │  Slot 1      │  Slot 2      │  Slot 3      │
-│  Task A      │  Task B      │  (empty)     │  Task A      │
-│  0~25ms      │  25~50ms     │  50~75ms     │  75~100ms    │
-├────────────────────────────────────────────────────────────┤
-                     ↑
-              현재 실행 중 (t = 30ms)
-
-Pullpiri → RegisterWorkload(Task C, L2 Sporadic)
-
-┌─────────────────────────────────────────────────────────────┐
-│  timpani-n 내부 처리                                        │
-│                                                             │
-│  Step 1: timpani-o 요청 수신, 테이블 재계산                 │
-│  Step 2: timpani-o가 timpani-n에 ScheduleTableUpdate 전송   │
-│  Step 3: timpani-n이 새 테이블을 Shadow map에 로드          │
-│                                                             │
-│  [Active Map: tt_table_map_1] ← ops.dispatch()가 참조       │
-│    Slot 0: Task A                                           │
-│    Slot 1: Task B                                           │
-│    Slot 2: (empty)                                          │
-│    Slot 3: Task A                                           │
-│                                                             │
-│  [Shadow Map: tt_table_map_0] ← 백그라운드 업데이트         │
-│    Slot 0: Task A                                           │
-│    Slot 1: Task B                                           │
-│    Slot 2: Task C (NEW!)  ← CBS slot 추가                   │
-│    Slot 3: Task A                                           │
-│                                                             │
-│  Step 4: shadow_ready = true 설정                           │
-└─────────────────────────────────────────────────────────────┘
-
-                    Hyperperiod 경계 (t = 100ms)
-                              ↓
-┌─────────────────────────────────────────────────────────────┐
-│  Atomic Swap                                                │
-│                                                             │
-│  active_map_idx = 0  ← 단일 u32 write (atomic)              │
-│                                                             │
-│  → ops.dispatch()는 이제 tt_table_map_0을 참조              │
-│  → Task C가 Slot 2에서 실행 가능                            │
-│  → Task A, B는 중단 없이 계속 실행                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 3.2 워크로드 제거 (STOP)
-
-**트리거:** Pullpiri가 `RemoveWorkload` 요청을 보내거나 `RecoveryService.EnforceRecoveryPolicy(RECOVERY_STOP)`를 호출 (DDR-003 §5.1)
-
-> **구현된 eviction 경로(`timpani26`)**: 제거는 아래 double-buffer swap이 아니라 userspace 증분 경로(§1.1)로 수행됩니다. `TimerMaster::remove_workload(workload_id_hash)`가 live 테이블에서 해당 워크로드 슬롯을 제거하고, running이면 per-CPU 타이머 스레드를 재구성합니다. BPF 상태는 `BpfLoader::delete_tt_slot()`, `delete_cbs_state()`, `delete_task_meta()`로 정리됩니다. `RECOVERY_STOP` 시 `RecoveryServiceImpl::EnforceRecoveryPolicy`가 워크로드를 제거하고 `broadcast_recovery_signal(workload_id, ACTION_STOP)`를 `NodeStream`으로 해당 노드에 보냅니다. 아래 `tt_table_map_0/_1` swap 다이어그램은 예비 double-buffer 설계(§2)입니다.
-
-```
-현재 상태:
-├────────────────────────────────────────────────────────────┤
-│  Slot 0      │  Slot 1      │  Slot 2      │  Slot 3      │
-│  Task A      │  Task B      │  Task C      │  Task A      │
-├────────────────────────────────────────────────────────────┤
-
-Pullpiri → RemoveWorkload(Task B)
-
-┌─────────────────────────────────────────────────────────────┐
-│  Shadow Map 준비                                            │
-│                                                             │
-│  [Active: tt_table_map_0]                                   │
-│    Slot 0: Task A                                           │
-│    Slot 1: Task B  ← 아직 실행 중                           │
-│    Slot 2: Task C                                           │
-│    Slot 3: Task A                                           │
-│                                                             │
-│  [Shadow: tt_table_map_1] ← Task B 제거된 테이블 준비       │
-│    Slot 0: Task A                                           │
-│    Slot 1: (empty)  ← Task B 제거                          │
-│    Slot 2: Task C                                           │
-│    Slot 3: Task A                                           │
-└─────────────────────────────────────────────────────────────┘
-
-                    Hyperperiod 경계
-                         ↓
-┌─────────────────────────────────────────────────────────────┐
-│  Atomic Swap + BPF map cleanup                              │
-│                                                             │
-│  1. active_map_idx = 1                                      │
-│  2. task_meta_map에서 Task B의 pid 항목 삭제                │
-│  3. cbs_budget_map에서 Task B의 budget 항목 삭제 (L2인 경우)│
-│                                                             │
-│  → Task B는 더 이상 dispatch되지 않음                       │
-│  → Task A, C는 중단 없이 계속 실행                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 3.3 전체 테이블 교체 (모드 전환)
-
-**트리거:** 주행 모드 전환 (예: Parking → Highway)
-
-```
-[Parking Mode 테이블]
-├──────────────────────────────────────────────────────────────┤
-│  Slot 0       │  Slot 1       │  Slot 2       │  Slot 3     │
-│  Parking-Cam  │  Ultrasonic   │  Parking-AI   │  Display    │
-│  Period: 50ms │  Period: 25ms │  Period: 50ms │  Period: 50ms│
-├──────────────────────────────────────────────────────────────┤
-Hyperperiod = 50ms
-
-모드 전환 요청 → 전체 테이블 교체 필요
-
-[Highway Mode 테이블] ← Shadow map에 준비
-├──────────────────────────────────────────────────────────────┤
-│  Slot 0       │  Slot 1       │  Slot 2       │  Slot 3     │
-│  Front-Cam    │  Radar-Fusion │  ADAS-AI      │  Dashboard  │
-│  Period: 20ms │  Period: 10ms │  Period: 20ms │  Period: 33ms│
-├──────────────────────────────────────────────────────────────┤
-Hyperperiod = 660ms (LCM 재계산)
-
-┌─────────────────────────────────────────────────────────────┐
-│  전환 과정                                                   │
-│                                                             │
-│  1. timpani-o: 새 테이블 생성 + feasibility 검증            │
-│  2. timpani-n: Shadow map에 Highway 테이블 로드             │
-│  3. Timer Master: 현재 hyperperiod 완료 대기 (최대 50ms)    │
-│  4. Hyperperiod 경계에서:                                    │
-│     - active_map_idx swap (atomic)                          │
-│     - 새 hyperperiod(660ms) 기준으로 Timer Master 재설정    │
-│  5. 새 워크로드들 즉시 실행 시작                             │
-│                                                             │
-│  ★ 전환 중 jitter: 0 (hyperperiod 경계에서만 swap)          │
-│  ★ 기존 워크로드 중단 시간: 0ms                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 4. Timer Master 구현
-
-> **상태**: §4.1의 pseudo-code는 **기존 단일 스레드 double-buffer 설계**를 반영하며 `timpani26`과 **일치하지 않습니다**. 출시본에서 `TimerMaster`는 **격리 CPU마다 타이머 스레드 1개**(`cpu_thread_loop`)를 돌리고, in-place BPF map upsert + SHM generation 핸드셰이크로 테이블 변경을 적용하며(`performAtomicSwap()` / `active_map_idx` 없음), 공유 `epoch_ns` hyperperiod 격자에 정렬하고 늦은 시작은 catch-up합니다. 구현 모델은 §1.1 참조. §4.1은 예비 double-buffer 경로(§2)의 참조 설계로 남겨둡니다.
-
-### 4.1 유저스페이스 스레드 (C++)
-
-```cpp
-class TimerMaster {
-public:
-    void run() {
-        while (running_) {
-            // 다음 hyperperiod 경계까지 대기
-            uint64_t next_boundary = epoch_ns_ +
-                ((current_hp_ + 1) * hyperperiod_ns_);
-
-            struct timespec ts = ns_to_timespec(next_boundary);
-            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
-
-            // Shadow map 준비 완료 확인
-            if (shadow_ready_.load()) {
-                performAtomicSwap();
-            }
-
-            // 다음 hyperperiod로 진행
-            current_hp_++;
-
-            // 이 hyperperiod의 TT slot들 실행
-            dispatchTtSlots();
-        }
-    }
-
-private:
-    void performAtomicSwap() {
-        // Atomic swap: 단일 u32 write
-        uint32_t key = 0;
-        uint32_t new_idx = 1 - current_active_idx_;
-
-        bpf_map_update_elem(active_map_idx_fd_, &key, &new_idx, BPF_ANY);
-
-        current_active_idx_ = new_idx;
-        shadow_ready_.store(false);
-
-        // 새 hyperperiod 적용 (변경된 경우)
-        if (new_hyperperiod_ns_ != hyperperiod_ns_) {
-            hyperperiod_ns_ = new_hyperperiod_ns_;
-            LOG_INFO("Hyperperiod가 {} ns로 업데이트됨", hyperperiod_ns_);
-        }
-
-        LOG_INFO("Schedule table이 hyperperiod {}에서 swap됨", current_hp_);
-    }
-
-    void dispatchTtSlots() {
-        // 현재 hyperperiod의 TT slot들을 순회
-        for (const auto& slot : tt_slots_) {
-            uint64_t fire_time = epoch_ns_ +
-                (current_hp_ * hyperperiod_ns_) +
-                (slot.offset_us * 1000);
-
-            struct timespec ts = ns_to_timespec(fire_time);
-            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
-
-            // current_slot_map 업데이트 및 CPU kick
-            updateCurrentSlot(slot.cpu, slot.slot_idx);
-            kickCpu(slot.cpu);
-        }
-    }
-
-    std::atomic<bool> shadow_ready_{false};
-    uint32_t current_active_idx_ = 0;
-    uint64_t hyperperiod_ns_;
-    uint64_t new_hyperperiod_ns_;
-    uint64_t current_hp_ = 0;
-    int active_map_idx_fd_;
-};
-```
-
-### 4.2 Shadow Map 업데이트 (gRPC Handler)
-
-```cpp
-Status GrpcHandler::HandleScheduleTableUpdate(
-    const ScheduleTableUpdate& update) {
-
-    // Shadow(비활성) map 결정
-    uint32_t shadow_idx = 1 - timer_master_->currentActiveIdx();
-    int shadow_fd = (shadow_idx == 0) ?
-        tt_table_map_0_fd_ : tt_table_map_1_fd_;
-
-    // Shadow map 초기화
-    clearBpfMap(shadow_fd);
-
-    // 새 테이블을 shadow map에 로드
-    for (const auto& slot : update.tt_slots()) {
-        struct TtSlotKey key = {
-            .cpu = slot.cpu(),
-            .slot_idx = slot.slot_idx()
-        };
-        struct TtSlotBpf value = {
-            .workload_id_hash = hashWorkloadId(slot.workload_id()),
-            .task_id_hash = hashTaskId(slot.task_id()),
-            .offset_us = slot.offset_us(),
-            .duration_us = slot.duration_us(),
-            .deadline_us = slot.deadline_us(),
-            .cpu = slot.cpu()
-        };
-        bpf_map_update_elem(shadow_fd, &key, &value, BPF_ANY);
-    }
-
-    // Hyperperiod가 변경된 경우 업데이트
-    if (update.hyperperiod_us() != timer_master_->hyperperiodUs()) {
-        timer_master_->setNewHyperperiod(update.hyperperiod_us() * 1000);
-    }
-
-    // Shadow map 준비 완료 시그널
-    timer_master_->setShadowReady(true);
-
-    return Status::OK;
-}
-```
-
----
-
-## 5. STOP 시 BPF Map Cleanup
-
-워크로드가 정지될 때 다음 BPF map들을 정리해야 한다:
-
-| Map | Cleanup 동작 |
-|:--|:--|
-| `tt_table_map` | 해당 워크로드의 slot 제거 (shadow swap 통해) |
-| `task_meta_map` | pid → TaskMeta 항목 삭제 |
-| `cbs_budget_map` | workload → CbsState 항목 삭제 (L2만) |
-| `partition_map` | cgroup_id → PartitionInfo 항목 삭제 |
-
-```cpp
-void BpfLoader::cleanupWorkload(const std::string& workload_id) {
-    uint64_t wid_hash = hashWorkloadId(workload_id);
-
-    // 1. task_meta 항목 찾아서 삭제
-    for (auto& [pid, meta] : iterateMap(task_meta_map_fd_)) {
-        if (meta.workload_id_hash == wid_hash) {
-            bpf_map_delete_elem(task_meta_map_fd_, &pid);
-        }
-    }
-
-    // 2. CBS budget 항목 삭제 (L2)
-    bpf_map_delete_elem(cbs_budget_map_fd_, &wid_hash);
-
-    // 3. partition 항목 삭제
-    uint64_t cgroup_id = workload_cgroup_map_[workload_id];
-    bpf_map_delete_elem(partition_map_fd_, &cgroup_id);
-
-    LOG_INFO("워크로드 {}의 BPF map 정리 완료", workload_id);
-}
-```
-
----
-
-## 6. 타이밍 보장
-
-### 6.1 최악 지연 시간
-
-| 연산 | 지연 시간 | 비고 |
-|:--|:--|:--|
-| Shadow map 업데이트 | O(n) slots | 백그라운드, 비차단 |
-| Atomic swap | < 1 μs | 단일 u32 write |
-| 테이블 활성화 지연 | 0 ~ 1 hyperperiod | 경계 대기 |
-
-### 6.2 최대 전환 지연
-
-```
-최대 지연 = 현재 Hyperperiod 길이
-
-예시:
-- Hyperperiod = 100ms
-- 요청 도착 시점 t = 10ms
-- Swap 발생 시점 t = 100ms (다음 경계)
-- 최대 지연 = 90ms
-```
-
-### 6.3 왜 Hyperperiod 경계인가?
-
-임의 시점에서 swap하면 다음 문제 발생:
-1. **부분 slot 실행**: 태스크가 slot 중간에 선점될 수 있음
-2. **데드라인 miss**: 새 데드라인이 이미 지났을 수 있음
-3. **Budget 불일치**: CBS budget이 period와 정렬되지 않음
-
-Hyperperiod 경계에서 swap하면:
-- 모든 현재 slot이 자연스럽게 완료
-- 새 테이블이 정렬된 budget으로 시작
-- 결정론적 동작 유지
-
----
-
-## 7. 비교: 재시작 vs 무중단
-
-| 시나리오 | 재시작 방식 | 무중단 방식 |
-|:--|:--|:--|
-| 워크로드 추가 | 전체 데몬 재시작 (~수초) | Hyperperiod 경계 swap (~ms) |
-| 모드 전환 | 시스템 재부팅 (~수십초) | Atomic swap (< 1 μs) |
-| 장애 워크로드 제거 | 다른 워크로드도 영향 | 대상 워크로드만 격리 제거 |
-| SDV 안전 영향 | 재시작 중 차량 제어 불능 | 연속 운영 |
-
----
-
-## 8. 미결 항목
-
-- [ ] **B-2.1**: `active_map_idx` BPF map 구현 — 예비(deferred); BPF 테이블 map 통째 원자적 교체 상황에만 필요. 출시된 증분 갱신 경로(§1.1)에는 불필요.
-- [ ] **B-3.1**: BPF atomic swap 가능성 검증
-- [ ] 타겟 하드웨어에서 실제 swap 지연 시간 측정
-- [ ] 허용 가능한 전환 지연을 위한 최대 hyperperiod 정의
-
----
-
-## 9. 참조
-
-- DDR-005: sched_ext BPF 스케줄러 설계
-- DDR-006: 통신 아키텍처
-- DDR-007: TT + CBS 통합 스케줄링
-- Linux sched_ext 문서: `tools/sched_ext/`
+현재 설계의 검토 게이트는 정상 경계 전환의 커널/타이머/SHM 일관성, 뱅크 참조 수명, 공유 제어 영역의 target 메모리 순서, 기존 ABI 보존이다. 만족하지 못하면 Phase 0 완료로 인정하지 않는다. 이 문서 세트에는 구현계획을 작성하지 않는다.
