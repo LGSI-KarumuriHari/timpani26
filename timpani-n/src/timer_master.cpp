@@ -488,10 +488,12 @@ void TimerMaster::wake_task(uint64_t task_id_hash, uint64_t deadline_ns)
     auto& release = ttsched_shm_->releases[idx];
     auto* counter = &ttsched_shm_->tasks[idx].counter;
     const uint32_t next_counter = __atomic_load_n(counter, __ATOMIC_RELAXED) + 1u;
-    __atomic_fetch_add(&release.version, 1u, __ATOMIC_SEQ_CST);
+    /* An odd version left by a killed node must not block later publications. */
+    const uint32_t base_version = __atomic_load_n(&release.version, __ATOMIC_RELAXED) & ~1u;
+    __atomic_store_n(&release.version, base_version + 1u, __ATOMIC_SEQ_CST);
     __atomic_store_n(&release.counter, next_counter, __ATOMIC_SEQ_CST);
     __atomic_store_n(&release.deadline_ns, deadline_ns, __ATOMIC_SEQ_CST);
-    __atomic_fetch_add(&release.version, 1u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&release.version, base_version + 2u, __ATOMIC_SEQ_CST);
     __atomic_store_n(counter, next_counter, __ATOMIC_RELEASE);
     syscall(SYS_futex, const_cast<uint32_t*>(counter),
             FUTEX_WAKE, 1, /* wake only the ONE task waiting on this counter */
