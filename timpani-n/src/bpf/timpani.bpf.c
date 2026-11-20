@@ -436,11 +436,12 @@ void BPF_PROG(stopping, struct task_struct* p, bool runnable)
         mark_tt_not_runnable(meta, bpf_get_smp_processor_id());
 }
 
-SEC("tracepoint/syscalls/sys_enter_futex")
-int tt_job_complete(struct trace_event_raw_sys_enter* ctx)
+/* fentry instead of a syscall tracepoint, which slows every syscall system-wide */
+SEC("fentry/futex_wake")
+int BPF_PROG(tt_job_complete, u32* uaddr, unsigned int flags, int nr_wake,
+             u32 bitset)
 {
-    if (ctx->args[1] != TIMPANI_TT_COMPLETE_OP ||
-        (__u32)ctx->args[5] != TIMPANI_TT_COMPLETE_BITSET)
+    if (bitset != TIMPANI_TT_COMPLETE_BITSET || nr_wake != 1)
         return 0;
 
     __u32 tid = (__u32)bpf_get_current_pid_tgid();
@@ -450,7 +451,7 @@ int tt_job_complete(struct trace_event_raw_sys_enter* ctx)
 
     struct timpani_tt_completion completion;
     __u64 now = bpf_ktime_get_ns();
-    if (bpf_probe_read_user(&completion, sizeof(completion), (void*)ctx->args[0]) ||
+    if (bpf_probe_read_user(&completion, sizeof(completion), uaddr) ||
         !completion.deadline_ns || now <= completion.deadline_ns)
         return 0;
 
