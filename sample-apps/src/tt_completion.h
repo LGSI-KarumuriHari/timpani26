@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright 2026 LG Electronics Inc.
+// SPDX-License-Identifier: MIT
+
+/* Internal libttsched/BPF contract, not a public ABI; to be replaced by #59. */
 #ifndef TIMPANI_TT_COMPLETION_H
 #define TIMPANI_TT_COMPLETION_H
 

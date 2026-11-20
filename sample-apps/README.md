@@ -46,6 +46,12 @@ TimerMaster releases a task late. After each released job, call the existing
 `ttsched_wait_next_period()` to mark completion and wait for another release.
 Ordinary blocking calls do not mark completion.
 
+A miss is judged when the job completes, not when its deadline expires. A job
+that never returns to `ttsched_wait_next_period()` is not reported. Detecting
+expired deadlines independently of completion is tracked in
+[#59](https://github.com/eclipse-timpani/timpani26/issues/59), which will also
+replace the internal completion marker used by this release.
+
 Deploy `timpani-n` and `libttsched` from the same release. For dynamically linked
 apps, replace `libttsched.so` and restart the app; recompiling the app is not
 required. Rebuild and redeploy apps that include `libttsched` statically. Rebuild
