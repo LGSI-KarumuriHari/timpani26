@@ -483,6 +483,7 @@ void TimerMaster::wake_task(uint64_t task_id_hash, uint64_t deadline_ns)
     /* Read the task-to-SHM mapping under schedule_mutex_ so this wake-up path
      * stays consistent with set_schedule_table()/remove_workload() updates. */
     std::lock_guard<std::mutex> lock(schedule_mutex_);
+    // Known race (#60): an old-table thread can still publish into a new generation.
 
     auto it = task_hash_to_shm_idx_.find(task_id_hash);
     if (it == task_hash_to_shm_idx_.end()) return;
