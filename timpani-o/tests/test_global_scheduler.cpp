@@ -256,15 +256,70 @@ TEST_F(GlobalSchedulerTest, Ddr007SampleWorkloads) {
     }
 
     // Two TT workloads go to separate CPUs:
-    //   CPU A: brake_ctrl (period=10ms, hyperperiod=10ms → 1 slot)
-    //   CPU B: steer_ctrl (period=20ms, hyperperiod=20ms → 1 slot)
-    // Total TT slots >= 2
-    EXPECT_GE(total_tt, 2);
+    //   CPU A: brake_ctrl (period=10ms, global hyperperiod=20ms → 2 slots)
+    //   CPU B: steer_ctrl (period=20ms, global hyperperiod=20ms → 1 slot)
+    // Total TT slots == 3 (brake_ctrl repeats twice in 20ms hyperperiod)
+    EXPECT_EQ(total_tt, 3);
     // Should have CBS entries for collision_det and lidar_main
     EXPECT_GE(total_cbs, 2);
 }
 
 // ─── Multi-CPU ──────────────────────────────────────────────────────────────
+
+TEST_F(GlobalSchedulerTest, MultiCpuTtDifferentPeriodsUnrollAcrossGlobalHyperperiod) {
+    // Reproduction case for multi-CPU TT under-scheduling bug:
+    // Workload 1: tt_task1 on CPU 2 (period=20ms, wcet=16ms, deadline=18ms)
+    // Workload 2: tt_task2 on CPU 3 (period=40ms, wcet=2ms,  deadline=4ms)
+    // Global hyperperiod = LCM(20ms, 40ms) = 40ms
+    // Expected:
+    //   CPU 2 partition has 2 slots (offset 0us, offset 20000us)
+    //   CPU 3 partition has 1 slot  (offset 0us)
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("fcw_producer_tt",  "tt_task1", 20000, 16000, 18000),
+        MakeTtTask("fcw_producer_tt2", "tt_task2", 40000,  2000,  4000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+
+    const auto& table = GetTable(result);
+    EXPECT_EQ(table.hyperperiod_us(), 40000u);
+    ASSERT_EQ(table.partitions_size(), 2);
+
+    int total_tt = 0;
+    std::vector<uint32_t> cpu2_offsets;
+    std::vector<uint32_t> cpu3_offsets;
+
+    for (int p = 0; p < table.partitions_size(); ++p) {
+        const auto& part = table.partitions(p);
+        ASSERT_GT(part.cpuset().cpus_size(), 0);
+        uint32_t cpu = part.cpuset().cpus(0);
+
+        for (int l = 0; l < part.layers_size(); ++l) {
+            const auto& layer = part.layers(l);
+            for (int s = 0; s < layer.tt_slots_size(); ++s) {
+                const auto& slot = layer.tt_slots(s);
+                total_tt++;
+                if (cpu == 2) {
+                    cpu2_offsets.push_back(slot.offset_us());
+                    EXPECT_EQ(slot.task_id(), "tt_task1");
+                    EXPECT_EQ(slot.duration_us(), 16000u);
+                } else if (cpu == 3) {
+                    cpu3_offsets.push_back(slot.offset_us());
+                    EXPECT_EQ(slot.task_id(), "tt_task2");
+                    EXPECT_EQ(slot.duration_us(), 2000u);
+                }
+            }
+        }
+    }
+
+    EXPECT_EQ(total_tt, 3);
+    ASSERT_EQ(cpu2_offsets.size(), 2u);
+    EXPECT_EQ(cpu2_offsets[0], 0u);
+    EXPECT_EQ(cpu2_offsets[1], 20000u);
+
+    ASSERT_EQ(cpu3_offsets.size(), 1u);
+    EXPECT_EQ(cpu3_offsets[0], 0u);
+}
 
 TEST_F(GlobalSchedulerTest, MultipleTtWorkloadsGetSeparateCpus) {
     // Two TT workloads should prefer separate CPUs
@@ -301,8 +356,7 @@ TEST_F(GlobalSchedulerTest, TableHasRequiredFields) {
     EXPECT_FALSE(table.table_id().empty());
     EXPECT_EQ(table.node_id(), "node1");
     EXPECT_GT(table.hyperperiod_us(), 0u);
-    // epoch_ns is assigned per publication batch, not per node table.
-    EXPECT_EQ(table.epoch_ns(), 0u);
+    EXPECT_GT(table.epoch_ns(), 0u);
 
     // Check TT slot hashes are non-zero
     for (int p = 0; p < table.partitions_size(); ++p) {

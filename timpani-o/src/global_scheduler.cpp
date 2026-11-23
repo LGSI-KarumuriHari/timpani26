@@ -65,6 +65,13 @@ ScheduleResult GlobalScheduler::generate_schedule(
                                + node_id + "'");
     }
 
+    // ── Compute global hyperperiod across all CPUs (TT tasks only) ──
+    std::vector<uint64_t> all_periods;
+    for (const auto& t : tt_tasks) {
+        if (t.period_us > 0) all_periods.push_back(t.period_us);
+    }
+    uint64_t global_hp = all_periods.empty() ? 0 : calculate_hyperperiod(all_periods);
+
     // ── Step 3: TT slot placement (per CPU) ──
     for (auto& [cpu_id, sched] : cpu_schedules) {
         // Collect TT tasks assigned to this CPU
@@ -93,20 +100,16 @@ ScheduleResult GlobalScheduler::generate_schedule(
                                    cpu_id, "", detail);
         }
 
-        uint64_t hp_us = calculate_hyperperiod(periods);
+        // TT slots must be placed across the full global hyperperiod so that
+        // tasks on this CPU are scheduled for every activation cycle within
+        // the global schedule table (DDR-007 §3.4, §3.6).
+        uint64_t hp_us = (global_hp > 0) ? global_hp : calculate_hyperperiod(periods);
 
         InfeasibleError err;
         if (!place_tt_slots(cpu_id, cpu_tt, hp_us, sched, err)) {
             return err;
         }
     }
-
-    // ── Compute global hyperperiod across all CPUs (TT tasks only) ──
-    std::vector<uint64_t> all_periods;
-    for (const auto& t : tt_tasks) {
-        if (t.period_us > 0) all_periods.push_back(t.period_us);
-    }
-    uint64_t global_hp = all_periods.empty() ? 0 : calculate_hyperperiod(all_periods);
 
     // ── Step 4: Gap analysis + CBS allocation (per CPU) ──
     for (auto& [cpu_id, sched] : cpu_schedules) {
