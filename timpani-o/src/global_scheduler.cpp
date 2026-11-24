@@ -72,6 +72,13 @@ ScheduleResult GlobalScheduler::generate_schedule(
     }
     uint64_t global_hp = all_periods.empty() ? 0 : calculate_hyperperiod(all_periods);
 
+    // ── Hyperperiod must fit in 32-bit limit without loss (REQ-011 AC-16) ──
+    if (global_hp > UINT32_MAX) {
+        return InfeasibleError(InfeasibleReason::TtSlotCapacityExceeded, -1, "",
+            "Global hyperperiod exceeds 32-bit limit (" + std::to_string(global_hp) +
+            " us > " + std::to_string(UINT32_MAX) + " us)");
+    }
+
     // ── Bound total unrolled TT slots across node (DDR-011 / tt_table_map capacity) ──
     if (global_hp > 0) {
         uint64_t total_slots = 0;
@@ -599,10 +606,16 @@ uint64_t GlobalScheduler::calculate_hyperperiod(
 
     uint64_t result = periods[0];
     for (size_t i = 1; i < periods.size(); ++i) {
-        result = lcm(result, periods[i]);
-        if (result > 3600000000ULL) {  // 1 hour in microseconds
-            TLOG_WARN("Hyperperiod very large: ", result / 1000000, " seconds");
+        if (result > UINT32_MAX || periods[i] > UINT32_MAX) {
+            return static_cast<uint64_t>(UINT32_MAX) + 1;
         }
+        uint64_t g = gcd(result, periods[i]);
+        uint64_t a = result / g;
+        // Stop as soon as the running LCM exceeds UINT32_MAX to prevent uint64 overflow
+        if (periods[i] > 0 && a > UINT32_MAX / periods[i]) {
+            return static_cast<uint64_t>(UINT32_MAX) + 1;
+        }
+        result = a * periods[i];
     }
     return result;
 }

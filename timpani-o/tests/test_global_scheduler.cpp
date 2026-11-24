@@ -366,6 +366,18 @@ TEST_F(GlobalSchedulerTest, TtSlotCapacityExactBoundary) {
     }
 }
 
+TEST_F(GlobalSchedulerTest, HyperperiodExceedingUint32LimitFails) {
+    // Large periods (3,000,000,000 us and 4,000,000,000 us) produce LCM = 12×10^9 us > UINT32_MAX.
+    // Must be rejected as TtSlotCapacityExceeded per REQ-011 AC-16 without representation loss.
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_a", "task_3s", 3000000000u, 100, 3000000000u),
+        MakeTtTask("wl_b", "task_4s", 4000000000u, 100, 4000000000u),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::TtSlotCapacityExceeded);
+}
+
 TEST_F(GlobalSchedulerTest, MultipleTtWorkloadsGetSeparateCpus) {
     // Two TT workloads should prefer separate CPUs
     std::vector<ClassifiedTask> tasks = {

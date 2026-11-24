@@ -180,7 +180,8 @@ public:
     static constexpr double U_OVERHEAD  = 0.02;   // Timer Master + BPF dispatch
     static constexpr double U_BOUND     = 0.80;   // Conservative utilization bound (DDR-004 §5)
     static constexpr uint32_t CBS_MIN_EXEC_US = 100; // Minimum usable gap (μs)
-    static constexpr uint32_t MAX_NODE_TT_SLOTS = 2048; // Max TT slot capacity in Timpani-N tt_table_map (DDR-011)
+    // Must match tt_table_map max_entries in timpani-n/src/bpf/timpani.bpf.c (DDR-011)
+    static constexpr uint32_t MAX_NODE_TT_SLOTS = 2048;
     static uint64_t fnv1a_hash(const char* s);
 
 private:
