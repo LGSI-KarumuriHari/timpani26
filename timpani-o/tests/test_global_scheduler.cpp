@@ -267,7 +267,7 @@ TEST_F(GlobalSchedulerTest, Ddr007SampleWorkloads) {
 // ─── Multi-CPU ──────────────────────────────────────────────────────────────
 
 TEST_F(GlobalSchedulerTest, MultiCpuTtDifferentPeriodsUnrollAcrossGlobalHyperperiod) {
-    // Reproduction case for multi-CPU TT under-scheduling bug:
+    // Reproduction case for multi-CPU TT under-scheduling bug (#61):
     // Workload 1: tt_task1 on CPU 2 (period=20ms, wcet=16ms, deadline=18ms)
     // Workload 2: tt_task2 on CPU 3 (period=40ms, wcet=2ms,  deadline=4ms)
     // Global hyperperiod = LCM(20ms, 40ms) = 40ms
@@ -321,6 +321,51 @@ TEST_F(GlobalSchedulerTest, MultiCpuTtDifferentPeriodsUnrollAcrossGlobalHyperper
     EXPECT_EQ(cpu3_offsets[0], 0u);
 }
 
+TEST_F(GlobalSchedulerTest, UnrolledSlotsExceedingNodeCapacityFails) {
+    // Non-harmonic periods on separate CPUs (1,000 us and 1,000,001 us)
+    // produce LCM ≈ 1,000,001,000 us. Unrolled slots = 1,000,001 + 1000 > 2048.
+    // Must be rejected as TtSlotCapacityExceeded to prevent scheduler stalling.
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_a", "task_fast", 1000, 100, 1000),
+        MakeTtTask("wl_b", "task_coprime", 1000001, 100, 1000001),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::TtSlotCapacityExceeded);
+}
+
+TEST_F(GlobalSchedulerTest, TtSlotCapacityExactBoundary) {
+    // Exact boundary test for MAX_NODE_TT_SLOTS (2048):
+    // Case 1: Exactly 2048 slots (2047 + 1 = 2048) -> SUCCEEDS
+    {
+        std::vector<ClassifiedTask> tasks = {
+            MakeTtTask("wl_a", "t_fast", 1000, 10, 1000),
+            MakeTtTask("wl_b", "t_slow", 2047000, 10, 2047000),
+        };
+        auto result = scheduler_->generate_schedule("node1", tasks);
+        ASSERT_TRUE(IsSuccess(result));
+        const auto& table = GetTable(result);
+        int total_tt = 0;
+        for (int p = 0; p < table.partitions_size(); ++p) {
+            for (int l = 0; l < table.partitions(p).layers_size(); ++l) {
+                total_tt += table.partitions(p).layers(l).tt_slots_size();
+            }
+        }
+        EXPECT_EQ(total_tt, 2048);
+    }
+
+    // Case 2: Exactly 2049 slots (2048 + 1 = 2049 > 2048) -> FAILS with TtSlotCapacityExceeded
+    {
+        std::vector<ClassifiedTask> tasks = {
+            MakeTtTask("wl_a", "t_fast", 1000, 10, 1000),
+            MakeTtTask("wl_b", "t_slow", 2048000, 10, 2048000),
+        };
+        auto result = scheduler_->generate_schedule("node1", tasks);
+        ASSERT_FALSE(IsSuccess(result));
+        EXPECT_EQ(GetError(result).reason, InfeasibleReason::TtSlotCapacityExceeded);
+    }
+}
+
 TEST_F(GlobalSchedulerTest, MultipleTtWorkloadsGetSeparateCpus) {
     // Two TT workloads should prefer separate CPUs
     std::vector<ClassifiedTask> tasks = {
@@ -341,6 +386,7 @@ TEST_F(GlobalSchedulerTest, FeasibilityConstants) {
     EXPECT_DOUBLE_EQ(GlobalScheduler::U_OVERHEAD, 0.02);
     EXPECT_DOUBLE_EQ(GlobalScheduler::U_BOUND, 0.80);
     EXPECT_EQ(GlobalScheduler::CBS_MIN_EXEC_US, 100u);
+    EXPECT_EQ(GlobalScheduler::MAX_NODE_TT_SLOTS, 2048u);
 }
 
 // ─── Table Structure Verification ───────────────────────────────────────────
@@ -356,7 +402,8 @@ TEST_F(GlobalSchedulerTest, TableHasRequiredFields) {
     EXPECT_FALSE(table.table_id().empty());
     EXPECT_EQ(table.node_id(), "node1");
     EXPECT_GT(table.hyperperiod_us(), 0u);
-    EXPECT_GT(table.epoch_ns(), 0u);
+    // epoch_ns is assigned per publication batch, not per node table.
+    EXPECT_EQ(table.epoch_ns(), 0u);
 
     // Check TT slot hashes are non-zero
     for (int p = 0; p < table.partitions_size(); ++p) {

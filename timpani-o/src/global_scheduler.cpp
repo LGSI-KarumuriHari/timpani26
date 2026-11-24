@@ -65,12 +65,27 @@ ScheduleResult GlobalScheduler::generate_schedule(
                                + node_id + "'");
     }
 
-    // ── Compute global hyperperiod across all CPUs (TT tasks only) ──
+    // ── Compute global hyperperiod across all CPUs (TT tasks only, DDR-011) ──
     std::vector<uint64_t> all_periods;
     for (const auto& t : tt_tasks) {
         if (t.period_us > 0) all_periods.push_back(t.period_us);
     }
     uint64_t global_hp = all_periods.empty() ? 0 : calculate_hyperperiod(all_periods);
+
+    // ── Bound total unrolled TT slots across node (DDR-011 / tt_table_map capacity) ──
+    if (global_hp > 0) {
+        uint64_t total_slots = 0;
+        for (const auto& t : tt_tasks) {
+            if (t.period_us > 0) {
+                total_slots += global_hp / t.period_us;
+                if (total_slots > MAX_NODE_TT_SLOTS) {
+                    return InfeasibleError(InfeasibleReason::TtSlotCapacityExceeded, -1, "",
+                        "Total unrolled TT slots (" + std::to_string(total_slots) +
+                        ") exceeds node capacity (" + std::to_string(MAX_NODE_TT_SLOTS) + ")");
+                }
+            }
+        }
+    }
 
     // ── Step 3: TT slot placement (per CPU) ──
     for (auto& [cpu_id, sched] : cpu_schedules) {
@@ -100,10 +115,8 @@ ScheduleResult GlobalScheduler::generate_schedule(
                                    cpu_id, "", detail);
         }
 
-        // TT slots must be placed across the full global hyperperiod so that
-        // tasks on this CPU are scheduled for every activation cycle within
-        // the global schedule table (DDR-007 §3.4, §3.6).
-        uint64_t hp_us = (global_hp > 0) ? global_hp : calculate_hyperperiod(periods);
+        // Slots are expanded over the fixed node-wide hyperperiod (DDR-011)
+        uint64_t hp_us = global_hp;
 
         InfeasibleError err;
         if (!place_tt_slots(cpu_id, cpu_tt, hp_us, sched, err)) {
