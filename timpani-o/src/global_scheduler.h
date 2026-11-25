@@ -108,6 +108,7 @@ enum class InfeasibleReason {
     SafetyCbsExceeded,   // L2 CBS bandwidth exceeds available budget
     NoCbsCpu,            // No isolated CPU available for CBS tasks
     UtilizationExceeded, // Total utilization exceeds bound
+    TtSlotCapacityExceeded, // Total unrolled TT slots exceed node capacity (DDR-011)
 };
 
 /**
@@ -175,10 +176,12 @@ public:
     ScheduleResult generate_schedule(const std::string& node_id,
                                      const std::vector<ClassifiedTask>& tasks);
 
-    // DDR-007 §3.5 feasibility constants
+    // DDR-007 §3.5 & DDR-011 feasibility constants
     static constexpr double U_OVERHEAD  = 0.02;   // Timer Master + BPF dispatch
     static constexpr double U_BOUND     = 0.80;   // Conservative utilization bound (DDR-004 §5)
     static constexpr uint32_t CBS_MIN_EXEC_US = 100; // Minimum usable gap (μs)
+    // Must match tt_table_map max_entries in timpani-n/src/bpf/timpani.bpf.c (DDR-011)
+    static constexpr uint32_t MAX_NODE_TT_SLOTS = 2048;
     static uint64_t fnv1a_hash(const char* s);
 
 private:

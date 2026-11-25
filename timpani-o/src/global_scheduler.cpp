@@ -65,6 +65,35 @@ ScheduleResult GlobalScheduler::generate_schedule(
                                + node_id + "'");
     }
 
+    // ── Compute global hyperperiod across all CPUs (TT tasks only, DDR-011) ──
+    std::vector<uint64_t> all_periods;
+    for (const auto& t : tt_tasks) {
+        if (t.period_us > 0) all_periods.push_back(t.period_us);
+    }
+    uint64_t global_hp = all_periods.empty() ? 0 : calculate_hyperperiod(all_periods);
+
+    // ── Hyperperiod must fit in 32-bit limit without loss (REQ-011 AC-16) ──
+    if (global_hp > UINT32_MAX) {
+        return InfeasibleError(InfeasibleReason::TtSlotCapacityExceeded, -1, "",
+            "Global hyperperiod exceeds 32-bit limit (" + std::to_string(global_hp) +
+            " us > " + std::to_string(UINT32_MAX) + " us)");
+    }
+
+    // ── Bound total unrolled TT slots across node (DDR-011 / tt_table_map capacity) ──
+    if (global_hp > 0) {
+        uint64_t total_slots = 0;
+        for (const auto& t : tt_tasks) {
+            if (t.period_us > 0) {
+                total_slots += global_hp / t.period_us;
+                if (total_slots > MAX_NODE_TT_SLOTS) {
+                    return InfeasibleError(InfeasibleReason::TtSlotCapacityExceeded, -1, "",
+                        "Total unrolled TT slots (" + std::to_string(total_slots) +
+                        ") exceeds node capacity (" + std::to_string(MAX_NODE_TT_SLOTS) + ")");
+                }
+            }
+        }
+    }
+
     // ── Step 3: TT slot placement (per CPU) ──
     for (auto& [cpu_id, sched] : cpu_schedules) {
         // Collect TT tasks assigned to this CPU
@@ -93,20 +122,14 @@ ScheduleResult GlobalScheduler::generate_schedule(
                                    cpu_id, "", detail);
         }
 
-        uint64_t hp_us = calculate_hyperperiod(periods);
+        // Slots are expanded over the fixed node-wide hyperperiod (DDR-011)
+        uint64_t hp_us = global_hp;
 
         InfeasibleError err;
         if (!place_tt_slots(cpu_id, cpu_tt, hp_us, sched, err)) {
             return err;
         }
     }
-
-    // ── Compute global hyperperiod across all CPUs (TT tasks only) ──
-    std::vector<uint64_t> all_periods;
-    for (const auto& t : tt_tasks) {
-        if (t.period_us > 0) all_periods.push_back(t.period_us);
-    }
-    uint64_t global_hp = all_periods.empty() ? 0 : calculate_hyperperiod(all_periods);
 
     // ── Step 4: Gap analysis + CBS allocation (per CPU) ──
     for (auto& [cpu_id, sched] : cpu_schedules) {
@@ -583,10 +606,16 @@ uint64_t GlobalScheduler::calculate_hyperperiod(
 
     uint64_t result = periods[0];
     for (size_t i = 1; i < periods.size(); ++i) {
-        result = lcm(result, periods[i]);
-        if (result > 3600000000ULL) {  // 1 hour in microseconds
-            TLOG_WARN("Hyperperiod very large: ", result / 1000000, " seconds");
+        if (result > UINT32_MAX || periods[i] > UINT32_MAX) {
+            return static_cast<uint64_t>(UINT32_MAX) + 1;
         }
+        uint64_t g = gcd(result, periods[i]);
+        uint64_t a = result / g;
+        // Stop as soon as the running LCM exceeds UINT32_MAX to prevent uint64 overflow
+        if (periods[i] > 0 && a > UINT32_MAX / periods[i]) {
+            return static_cast<uint64_t>(UINT32_MAX) + 1;
+        }
+        result = a * periods[i];
     }
     return result;
 }
