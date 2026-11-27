@@ -234,6 +234,11 @@ bool NodeConfigManager::IsLoaded() const {
     return loaded_;
 }
 
+void NodeConfigManager::AddNodeConfig(const NodeConfig& config) {
+    nodes_[config.name] = config;
+    loaded_ = true;
+}
+
 NodeConfig NodeConfigManager::GetDefaultNodeConfig() {
     NodeConfig config;
     config.name = "default_node";

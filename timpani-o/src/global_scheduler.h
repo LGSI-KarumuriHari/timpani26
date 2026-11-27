@@ -179,10 +179,28 @@ public:
     // DDR-007 §3.5 & DDR-011 feasibility constants
     static constexpr double U_OVERHEAD  = 0.02;   // Timer Master + BPF dispatch
     static constexpr double U_BOUND     = 0.80;   // Conservative utilization bound (DDR-004 §5)
+    static constexpr double U_EPSILON   = 1e-6;   // Floating point tolerance for utilization comparisons
     static constexpr uint32_t CBS_MIN_EXEC_US = 100; // Minimum usable gap (μs)
     // Must match tt_table_map max_entries in timpani-n/src/bpf/timpani.bpf.c (DDR-011)
     static constexpr uint32_t MAX_NODE_TT_SLOTS = 2048;
     static uint64_t fnv1a_hash(const char* s);
+
+    /**
+     * @brief Checks if U_tt + U_cbs + U_OVERHEAD <= U_BOUND (with tolerance).
+     * Unified bound helper per Project Leader decision (DDR-007 §3.5, §6.3, §8.1).
+     */
+    static inline bool is_utilization_admissible(double u_tt, double u_cbs = 0.0) {
+        return (u_tt + u_cbs + U_OVERHEAD) <= (U_BOUND + U_EPSILON);
+    }
+
+    /**
+     * @brief Computes available residual bandwidth for CBS on a CPU.
+     * Returns 0.0 if not admissible or negative.
+     */
+    static inline double available_cbs_bandwidth(double u_tt, double u_cbs = 0.0) {
+        double avail = U_BOUND - u_tt - u_cbs - U_OVERHEAD;
+        return (avail > -U_EPSILON) ? std::max(0.0, avail) : 0.0;
+    }
 
 private:
     // ── Step 2: CPU assignment ──

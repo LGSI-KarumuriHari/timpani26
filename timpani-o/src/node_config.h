@@ -45,6 +45,12 @@ public:
     bool LoadFromFile(const std::string& config_file);
 
     /**
+     * @brief Programmatically add or update a node configuration
+     * @param config NodeConfig struct to register
+     */
+    void AddNodeConfig(const NodeConfig& config);
+
+    /**
      * @brief Get node configuration by name
      * @param node_name Name of the node
      * @return Pointer to NodeConfig if found, nullptr otherwise

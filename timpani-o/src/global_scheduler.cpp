@@ -65,6 +65,22 @@ ScheduleResult GlobalScheduler::generate_schedule(
                                + node_id + "'");
     }
 
+    // ── Utilization Admissibility Check per CPU (DDR-007 §3.5, §6.3, §8.1 / #68) ──
+    for (const auto& [cpu_id, sched] : cpu_schedules) {
+        if (sched.u_tt > 0.0 || sched.u_cbs > 0.0) {
+            if (!is_utilization_admissible(sched.u_tt, sched.u_cbs)) {
+                return InfeasibleError(
+                    InfeasibleReason::UtilizationExceeded, cpu_id, "",
+                    "Total utilization exceeds bound on CPU " + std::to_string(cpu_id) +
+                    ": U_tt=" + std::to_string(sched.u_tt) +
+                    ", U_cbs=" + std::to_string(sched.u_cbs) +
+                    ", U_overhead=" + std::to_string(U_OVERHEAD) +
+                    " (sum=" + std::to_string(sched.u_tt + sched.u_cbs + U_OVERHEAD) +
+                    " > U_bound=" + std::to_string(U_BOUND) + ")");
+            }
+        }
+    }
+
     // ── Compute global hyperperiod across all CPUs (TT tasks only, DDR-011) ──
     std::vector<uint64_t> all_periods;
     for (const auto& t : tt_tasks) {
@@ -258,9 +274,11 @@ bool GlobalScheduler::assign_cpus(
         double best_residual = -1.0;
 
         for (int cpu : available_cpus) {
-            double residual = U_BOUND - cpu_schedules[cpu].u_tt -
-                              cpu_schedules[cpu].u_cbs - U_OVERHEAD;
-            if (residual >= us && residual > best_residual) {
+            double residual = available_cbs_bandwidth(cpu_schedules[cpu].u_tt,
+                                                      cpu_schedules[cpu].u_cbs);
+            if (is_utilization_admissible(cpu_schedules[cpu].u_tt,
+                                          cpu_schedules[cpu].u_cbs + us) &&
+                residual > best_residual) {
                 best_residual = residual;
                 best_cpu = cpu;
             }
@@ -431,7 +449,7 @@ bool GlobalScheduler::allocate_cbs_budgets(
     PerCpuSchedule& schedule,
     InfeasibleError& error)
 {
-    double u_avail = U_BOUND - u_tt - U_OVERHEAD;
+    double u_avail = available_cbs_bandwidth(u_tt, 0.0);
 
     if (u_avail <= 0.0) {
         error = InfeasibleError(InfeasibleReason::NoCbsBandwidth, cpu, "",

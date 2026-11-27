@@ -18,6 +18,13 @@ protected:
         scheduler_ = std::make_unique<GlobalScheduler>(node_config_manager_);
     }
 
+    void SetAvailableCpus(const std::string& node_id, const std::vector<int>& cpus) {
+        NodeConfig cfg;
+        cfg.name = node_id;
+        cfg.available_cpus = cpus;
+        node_config_manager_->AddNodeConfig(cfg);
+    }
+
     ClassifiedTask MakeTtTask(const std::string& wl_id,
                               const std::string& task_id,
                               uint32_t period_us,
@@ -67,9 +74,10 @@ protected:
     std::unique_ptr<GlobalScheduler> scheduler_;
 };
 
-// ─── Classification ─────────────────────────────────────────────────────────
+// ─── 1. Classification & Basic Schedule Generation ──────────────────────────
 
 TEST_F(GlobalSchedulerTest, SingleTtTaskProducesTable) {
+    SetAvailableCpus("node1", {2});
     std::vector<ClassifiedTask> tasks = {
         MakeTtTask("brake", "brake_ctrl", 10000, 2000, 5000)
     };
@@ -78,10 +86,11 @@ TEST_F(GlobalSchedulerTest, SingleTtTaskProducesTable) {
 
     const auto& table = GetTable(result);
     EXPECT_EQ(table.node_id(), "node1");
-    EXPECT_GT(table.partitions_size(), 0);
+    EXPECT_EQ(table.partitions_size(), 1);
 }
 
 TEST_F(GlobalSchedulerTest, SingleCbsTaskProducesTable) {
+    SetAvailableCpus("node1", {2});
     std::vector<ClassifiedTask> tasks = {
         MakeCbsTask("lidar", "lidar_main", 5000, 2000, 5000)
     };
@@ -89,9 +98,8 @@ TEST_F(GlobalSchedulerTest, SingleCbsTaskProducesTable) {
     ASSERT_TRUE(IsSuccess(result));
 
     const auto& table = GetTable(result);
-    EXPECT_GT(table.partitions_size(), 0);
+    EXPECT_EQ(table.partitions_size(), 1);
 
-    // Should have CBS entries
     bool has_cbs = false;
     for (int p = 0; p < table.partitions_size(); ++p) {
         for (int l = 0; l < table.partitions(p).layers_size(); ++l) {
@@ -111,9 +119,21 @@ TEST_F(GlobalSchedulerTest, EmptyTasksReturnsEmptyTable) {
     EXPECT_EQ(table.partitions_size(), 0);
 }
 
-// ─── Harmonic Period Validation ─────────────────────────────────────────────
+TEST_F(GlobalSchedulerTest, UnconfiguredNodeFallsBackToDefaultCpus) {
+    // Without calling SetAvailableCpus(), GlobalScheduler falls back to [2, 3].
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_a", "task_a", 10000, 2000, 5000),
+        MakeTtTask("wl_b", "task_b", 10000, 2000, 5000),
+    };
+    auto result = scheduler_->generate_schedule("unconfigured_node", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+    EXPECT_EQ(GetTable(result).partitions_size(), 2);
+}
+
+// ─── 2. Harmonic Period Validation ──────────────────────────────────────────
 
 TEST_F(GlobalSchedulerTest, HarmonicPeriodsSucceed) {
+    SetAvailableCpus("node1", {2});
     // 5ms, 10ms, 20ms are harmonic (5 | 10, 5 | 20, 10 | 20)
     std::vector<ClassifiedTask> tasks = {
         MakeTtTask("wl1", "t1", 5000, 500, 5000),
@@ -125,6 +145,7 @@ TEST_F(GlobalSchedulerTest, HarmonicPeriodsSucceed) {
 }
 
 TEST_F(GlobalSchedulerTest, NonHarmonicPeriodsReturnError) {
+    SetAvailableCpus("node1", {2});
     // 7ms and 10ms are not harmonic
     std::vector<ClassifiedTask> tasks = {
         MakeTtTask("wl1", "t1", 7000, 500, 7000),
@@ -135,55 +156,75 @@ TEST_F(GlobalSchedulerTest, NonHarmonicPeriodsReturnError) {
     EXPECT_EQ(GetError(result).reason, InfeasibleReason::NonHarmonicPeriod);
 }
 
-// ─── TT Slot Placement ─────────────────────────────────────────────────────
+// ─── 3. TT Slot Placement & DM Ordering ─────────────────────────────────────
 
 TEST_F(GlobalSchedulerTest, TtSlotOffsetsMatchPeriod) {
-    // Single task with period=10ms, wcet=2ms in hyperperiod=20ms
-    // Expect 2 slots at offsets 0 and 10000
+    SetAvailableCpus("node1", {2});
+    // Two harmonic tasks on same CPU: fast (period=10ms, wcet=2ms), slow (period=20ms, wcet=2ms)
+    // Hyperperiod = 20ms -> fast repeats twice at offsets 0us and 10000us.
     std::vector<ClassifiedTask> tasks = {
-        MakeTtTask("brake", "brake_ctrl", 10000, 2000, 5000),
+        MakeTtTask("wl1", "t_fast", 10000, 2000, 5000),
+        MakeTtTask("wl1", "t_slow", 20000, 2000, 10000),
     };
     auto result = scheduler_->generate_schedule("node1", tasks);
     ASSERT_TRUE(IsSuccess(result));
 
     const auto& table = GetTable(result);
-    ASSERT_GT(table.partitions_size(), 0);
+    EXPECT_EQ(table.hyperperiod_us(), 20000u);
+    ASSERT_EQ(table.partitions_size(), 1);
 
     const auto& layer = table.partitions(0).layers(0);
-    // With period 10000 in hyperperiod 10000 → 1 slot at offset 0
-    // (hyperperiod = max period = 10000 under harmonic assumption)
-    EXPECT_GE(layer.tt_slots_size(), 1);
-    EXPECT_EQ(layer.tt_slots(0).offset_us(), 0u);
-    EXPECT_EQ(layer.tt_slots(0).duration_us(), 2000u);
+    ASSERT_EQ(layer.tt_slots_size(), 3);
+
+    std::vector<uint32_t> fast_offsets;
+    std::vector<uint32_t> slow_offsets;
+    for (int i = 0; i < layer.tt_slots_size(); ++i) {
+        const auto& slot = layer.tt_slots(i);
+        if (slot.task_id() == "t_fast") {
+            fast_offsets.push_back(slot.offset_us());
+            EXPECT_EQ(slot.duration_us(), 2000u);
+        } else if (slot.task_id() == "t_slow") {
+            slow_offsets.push_back(slot.offset_us());
+            EXPECT_EQ(slot.duration_us(), 2000u);
+        }
+    }
+    ASSERT_EQ(fast_offsets.size(), 2u);
+    EXPECT_EQ(fast_offsets[0], 0u);
+    EXPECT_EQ(fast_offsets[1], 10000u);
+    ASSERT_EQ(slow_offsets.size(), 1u);
+    EXPECT_EQ(slow_offsets[0], 2000u);
 }
 
 TEST_F(GlobalSchedulerTest, DmOrderingShorterDeadlineFirst) {
-    // Two tasks: brake(deadline=5ms), steer(deadline=10ms)
+    SetAvailableCpus("node1", {2});
+    // Two tasks in same workload: brake(deadline=5ms), steer(deadline=10ms)
     // DM ordering: brake gets placed first at offset 0
     std::vector<ClassifiedTask> tasks = {
-        MakeTtTask("brake", "brake_ctrl", 10000, 2000, 5000),
-        MakeTtTask("steer", "steer_ctrl", 10000, 2000, 10000),
+        MakeTtTask("wl1", "steer_ctrl", 10000, 2000, 10000),
+        MakeTtTask("wl1", "brake_ctrl", 10000, 2000, 5000),
     };
     auto result = scheduler_->generate_schedule("node1", tasks);
     ASSERT_TRUE(IsSuccess(result));
 
     const auto& table = GetTable(result);
-    ASSERT_GT(table.partitions_size(), 0);
-
-    // Find the partition with TT slots
-    for (int p = 0; p < table.partitions_size(); ++p) {
-        const auto& layer = table.partitions(p).layers(0);
-        if (layer.tt_slots_size() >= 2) {
-            // First placed task (brake, deadline=5ms) should have offset=0
-            EXPECT_EQ(layer.tt_slots(0).task_id(), "brake_ctrl");
-            EXPECT_EQ(layer.tt_slots(0).offset_us(), 0u);
-        }
-    }
+    ASSERT_EQ(table.partitions_size(), 1);
+    const auto& layer = table.partitions(0).layers(0);
+    ASSERT_EQ(layer.tt_slots_size(), 2);
+    EXPECT_EQ(layer.tt_slots(0).task_id(), "brake_ctrl");
+    EXPECT_EQ(layer.tt_slots(0).offset_us(), 0u);
+    EXPECT_EQ(layer.tt_slots(1).task_id(), "steer_ctrl");
+    EXPECT_EQ(layer.tt_slots(1).offset_us(), 2000u);
 }
 
-// ─── Gap Extraction ─────────────────────────────────────────────────────────
+
+// TtSlotConflictWhenDeadlineTightRejected will be added after #69 fix 
+
+// MultipleTtWorkloadsWithinDeadlinesNoSlotConflict will be added after #69 fix 
+
+// ─── 4. Gap Extraction & CBS Allocation ─────────────────────────────────────
 
 TEST_F(GlobalSchedulerTest, NoTtSlotsProducesFullGap) {
+    SetAvailableCpus("node1", {2});
     // CBS-only workload → entire hyperperiod is a gap
     std::vector<ClassifiedTask> tasks = {
         MakeCbsTask("lidar", "lidar_main", 5000, 1000, 5000),
@@ -192,10 +233,9 @@ TEST_F(GlobalSchedulerTest, NoTtSlotsProducesFullGap) {
     ASSERT_TRUE(IsSuccess(result));
 }
 
-// ─── CBS Allocation ─────────────────────────────────────────────────────────
-
 TEST_F(GlobalSchedulerTest, CbsWithinBudgetSucceeds) {
-    // TT uses 20% utilization, CBS uses 30% → total 52% < 80% bound
+    SetAvailableCpus("node1", {2});
+    // Single CPU: TT 20% + CBS 30% + overhead 2% = 52% <= 80%
     std::vector<ClassifiedTask> tasks = {
         MakeTtTask("brake", "brake_ctrl", 10000, 2000, 5000),   // U=0.20
         MakeCbsTask("lidar", "lidar_main", 10000, 3000, 10000), // U=0.30
@@ -205,77 +245,157 @@ TEST_F(GlobalSchedulerTest, CbsWithinBudgetSucceeds) {
 }
 
 TEST_F(GlobalSchedulerTest, CbsExceedingBandwidthFails) {
-    // With 2 default CPUs, TT and CBS go to separate CPUs.
-    // To trigger overload, we need CBS utilization alone to exceed
-    // U_BOUND on whatever CPU it lands on.
+    SetAvailableCpus("node1", {2, 3});
     // CBS_U = 0.85 > 0.80 - 0.02 = 0.78 → must fail
     std::vector<ClassifiedTask> tasks = {
         MakeCbsTask("wl2", "cbs1", 10000, 8500, 10000),  // U=0.85
     };
     auto result = scheduler_->generate_schedule("node1", tasks);
     ASSERT_FALSE(IsSuccess(result));
-    // CBS over-capacity is caught during CPU assignment
-    auto reason = GetError(result).reason;
-    EXPECT_TRUE(reason == InfeasibleReason::UtilizationExceeded ||
-                reason == InfeasibleReason::NoCbsCpu);
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
 }
 
-// ─── End-to-End: DDR-007 §5 Sample Workloads ────────────────────────────────
+// ─── 5. Single-CPU Utilization Admissibility & Edge Cases (Issue #68) ───────
 
-TEST_F(GlobalSchedulerTest, Ddr007SampleWorkloads) {
-    // From DDR-007 §5.1:
-    //   brake_ctrl    (L1, period=10ms,  wcet=2ms,   deadline=5ms)
-    //   steer_ctrl    (L1, period=20ms,  wcet=2ms,   deadline=10ms)
-    //   collision_det (L2, MIT=10ms,     wcet=1.5ms, deadline=10ms)
-    //   lidar_proc    (L2, MIT=5ms,      wcet=2ms,   deadline=5ms)
+TEST_F(GlobalSchedulerTest, SingleCpuTtMaxUtilization100PercentRejected) {
+    SetAvailableCpus("node1", {2});
+    // Single TT task with 100% utilization (runtime == period == 20000us)
+    // U_tt = 1.0 > 0.78 bound -> Must be rejected with UtilizationExceeded
     std::vector<ClassifiedTask> tasks = {
-        MakeTtTask("brake", "brake_ctrl", 10000, 2000, 5000),
-        MakeTtTask("steer", "steer_ctrl", 20000, 2000, 10000),
-        MakeCbsTask("collision", "col_detect", 10000, 1500, 10000),
-        MakeCbsTask("lidar_proc", "lidar_main", 5000, 2000, 5000),
+        MakeTtTask("wl_max", "task_100", 20000, 20000, 20000),
     };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+    EXPECT_EQ(GetError(result).cpu, 2);
+}
 
+TEST_F(GlobalSchedulerTest, SingleCpuTtUtilizationAboveBoundRejected) {
+    SetAvailableCpus("node1", {2});
+    // Single TT task with U_tt = 0.80 (+0.02 overhead = 0.82 > 0.80)
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_over", "task_80", 20000, 16000, 20000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+    EXPECT_EQ(GetError(result).cpu, 2);
+}
+
+TEST_F(GlobalSchedulerTest, SingleCpuTtUtilizationJustAboveBoundRejected) {
+    SetAvailableCpus("node1", {2});
+    // Edge case: U_tt = 3901 / 5000 = 0.7802 (+0.02 = 0.8002 > 0.80)
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_edge", "task_just_over", 50000, 39010, 50000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+    EXPECT_EQ(GetError(result).cpu, 2);
+}
+
+TEST_F(GlobalSchedulerTest, SingleCpuTtAtExactBoundAccepted) {
+    SetAvailableCpus("node1", {2});
+    // U_tt = 39000 / 50000 = 0.78; with U_OVERHEAD = 0.02 -> sum = 0.80 == U_BOUND
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_exact", "task_78", 50000, 39000, 50000),
+    };
     auto result = scheduler_->generate_schedule("node1", tasks);
     ASSERT_TRUE(IsSuccess(result));
-
-    const auto& table = GetTable(result);
-    EXPECT_EQ(table.node_id(), "node1");
-    EXPECT_GT(table.hyperperiod_us(), 0u);
-    EXPECT_GT(table.partitions_size(), 0);
-
-    // Count total TT slots and CBS entries across all partitions
-    int total_tt = 0;
-    int total_cbs = 0;
-    for (int p = 0; p < table.partitions_size(); ++p) {
-        for (int l = 0; l < table.partitions(p).layers_size(); ++l) {
-            total_tt += table.partitions(p).layers(l).tt_slots_size();
-            total_cbs += table.partitions(p).layers(l).cbs_entries_size();
-        }
-        // Each partition should have isolated=true
-        EXPECT_TRUE(table.partitions(p).cpuset().isolated());
-    }
-
-    // Two TT workloads go to separate CPUs:
-    //   CPU A: brake_ctrl (period=10ms, global hyperperiod=20ms → 2 slots)
-    //   CPU B: steer_ctrl (period=20ms, global hyperperiod=20ms → 1 slot)
-    // Total TT slots == 3 (brake_ctrl repeats twice in 20ms hyperperiod)
-    EXPECT_EQ(total_tt, 3);
-    // Should have CBS entries for collision_det and lidar_main
-    EXPECT_GE(total_cbs, 2);
+    EXPECT_EQ(GetTable(result).partitions_size(), 1);
 }
 
-// ─── Multi-CPU ──────────────────────────────────────────────────────────────
+TEST_F(GlobalSchedulerTest, SingleCpuTtBelowBoundAccepted) {
+    SetAvailableCpus("node1", {2});
+    // U_tt = 0.50 (wcet 10000, period 20000)
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_ok", "task_50", 20000, 10000, 20000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+}
+
+TEST_F(GlobalSchedulerTest, SingleCpuMultipleTtTasksSameWorkloadExceedingBoundRejected) {
+    SetAvailableCpus("node1", {2});
+    // Same workload with two TT tasks: 0.40 + 0.40 = 0.80 > 0.78
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_same", "tt_1", 10000, 4000, 10000),
+        MakeTtTask("wl_same", "tt_2", 10000, 4000, 10000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+    EXPECT_EQ(GetError(result).cpu, 2);
+}
+
+TEST_F(GlobalSchedulerTest, SingleCpuMultipleTtWorkloadsExceedingBoundRejected) {
+    SetAvailableCpus("node1", {2});
+    // Single CPU [2]: two TT workloads (0.40 + 0.40 = 0.80 > 0.78)
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_1", "tt_1", 10000, 4000, 10000),
+        MakeTtTask("wl_2", "tt_2", 10000, 4000, 10000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+    EXPECT_EQ(GetError(result).cpu, 2);
+}
+
+TEST_F(GlobalSchedulerTest, SingleCpuCombinedTtAndCbsAtExactBoundAccepted) {
+    SetAvailableCpus("node1", {2});
+    // Single CPU [2]: U_tt=0.50, U_cbs=0.28, U_overhead=0.02 -> sum=0.80 == U_BOUND
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_tt", "tt_50", 20000, 10000, 20000),
+        MakeCbsTask("wl_cbs", "cbs_28", 10000, 2800, 10000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+    EXPECT_EQ(GetTable(result).partitions_size(), 1);
+}
+
+TEST_F(GlobalSchedulerTest, SingleCpuCombinedTtAndCbsAboveBoundRejected) {
+    SetAvailableCpus("node1", {2});
+    // Single CPU [2]: U_tt=0.50, U_cbs=0.29, U_overhead=0.02 -> sum=0.81 > U_BOUND
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_tt", "tt_50", 20000, 10000, 20000),
+        MakeCbsTask("wl_cbs", "cbs_29", 10000, 2900, 10000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+}
+
+TEST_F(GlobalSchedulerTest, SingleCpuCbsOnlyAtExactBoundAccepted) {
+    SetAvailableCpus("node1", {2});
+    // Single CPU [2]: U_cbs=0.78, U_overhead=0.02 -> sum=0.80 == U_BOUND
+    std::vector<ClassifiedTask> tasks = {
+        MakeCbsTask("wl_cbs", "cbs_78", 50000, 39000, 50000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+}
+
+TEST_F(GlobalSchedulerTest, SingleCpuCbsOnlyAboveBoundRejected) {
+    SetAvailableCpus("node1", {2});
+    // Single CPU [2]: U_cbs=0.79, U_overhead=0.02 -> sum=0.81 > U_BOUND
+    std::vector<ClassifiedTask> tasks = {
+        MakeCbsTask("wl_cbs", "cbs_79", 10000, 7900, 10000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+}
+
+// ─── 6. Multi-CPU Utilization, Topology & Hyperperiod Tests ─────────────────
 
 TEST_F(GlobalSchedulerTest, MultiCpuTtDifferentPeriodsUnrollAcrossGlobalHyperperiod) {
+    SetAvailableCpus("node1", {2, 3});
     // Reproduction case for multi-CPU TT under-scheduling bug (#61):
-    // Workload 1: tt_task1 on CPU 2 (period=20ms, wcet=16ms, deadline=18ms)
-    // Workload 2: tt_task2 on CPU 3 (period=40ms, wcet=2ms,  deadline=4ms)
+    // Workload 1: tt_task1 on CPU 2 (period=20ms, wcet=10ms, deadline=18ms) -> U_tt=0.50 <= 0.78
+    // Workload 2: tt_task2 on CPU 3 (period=40ms, wcet=2ms,  deadline=4ms)  -> U_tt=0.05 <= 0.78
     // Global hyperperiod = LCM(20ms, 40ms) = 40ms
-    // Expected:
-    //   CPU 2 partition has 2 slots (offset 0us, offset 20000us)
-    //   CPU 3 partition has 1 slot  (offset 0us)
     std::vector<ClassifiedTask> tasks = {
-        MakeTtTask("fcw_producer_tt",  "tt_task1", 20000, 16000, 18000),
+        MakeTtTask("fcw_producer_tt",  "tt_task1", 20000, 10000, 18000),
         MakeTtTask("fcw_producer_tt2", "tt_task2", 40000,  2000,  4000),
     };
     auto result = scheduler_->generate_schedule("node1", tasks);
@@ -302,7 +422,7 @@ TEST_F(GlobalSchedulerTest, MultiCpuTtDifferentPeriodsUnrollAcrossGlobalHyperper
                 if (cpu == 2) {
                     cpu2_offsets.push_back(slot.offset_us());
                     EXPECT_EQ(slot.task_id(), "tt_task1");
-                    EXPECT_EQ(slot.duration_us(), 16000u);
+                    EXPECT_EQ(slot.duration_us(), 10000u);
                 } else if (cpu == 3) {
                     cpu3_offsets.push_back(slot.offset_us());
                     EXPECT_EQ(slot.task_id(), "tt_task2");
@@ -321,10 +441,90 @@ TEST_F(GlobalSchedulerTest, MultiCpuTtDifferentPeriodsUnrollAcrossGlobalHyperper
     EXPECT_EQ(cpu3_offsets[0], 0u);
 }
 
+TEST_F(GlobalSchedulerTest, MultiCpuMultipleTtWorkloadsGetSeparateCpus) {
+    SetAvailableCpus("node1", {2, 3});
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_a", "task_a", 10000, 2000, 5000),
+        MakeTtTask("wl_b", "task_b", 10000, 2000, 5000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+    EXPECT_EQ(GetTable(result).partitions_size(), 2);
+}
+
+TEST_F(GlobalSchedulerTest, MultiCpuThreeCpusThreeWorkloadsAtExactBoundAccepted) {
+    SetAvailableCpus("node1", {2, 3, 4});
+    // 3 CPUs, 3 TT workloads each at exact bound 0.78 -> all accepted on separate CPUs
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_1", "tt_1", 50000, 39000, 50000),
+        MakeTtTask("wl_2", "tt_2", 50000, 39000, 50000),
+        MakeTtTask("wl_3", "tt_3", 50000, 39000, 50000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+    EXPECT_EQ(GetTable(result).partitions_size(), 3);
+}
+
+TEST_F(GlobalSchedulerTest, MultiCpuOneCpuOverloadedRejectsSchedule) {
+    SetAvailableCpus("node1", {2, 3});
+    // wl_1 on CPU 2 (U=0.50, valid), wl_2 on CPU 3 (U=0.80 > 0.78, invalid)
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_1", "tt_1", 20000, 10000, 20000),
+        MakeTtTask("wl_2", "tt_2", 20000, 16000, 20000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+    EXPECT_EQ(GetError(result).cpu, 3);
+}
+
+TEST_F(GlobalSchedulerTest, MultiCpuCombinedTtAndCbsAtExactBoundAccepted) {
+    SetAvailableCpus("node1", {2, 3});
+    // Fill CPU 3 with tt_other (U=0.78) so CBS is forced onto CPU 2:
+    // CPU 2: tt_main (U=0.50), cbs_task (U=0.28) -> sum = 0.50 + 0.28 + 0.02 = 0.80 == U_BOUND
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_tt2", "tt_main", 20000, 10000, 20000),   // CPU 2 (U=0.50)
+        MakeTtTask("wl_tt3", "tt_other", 50000, 39000, 50000),  // CPU 3 (U=0.78)
+        MakeCbsTask("wl_cbs", "cbs_28", 10000, 2800, 10000),    // Must go to CPU 2 (0.28 <= 0.28)
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+}
+
+TEST_F(GlobalSchedulerTest, MultiCpuCombinedTtAndCbsAboveBoundRejected) {
+    SetAvailableCpus("node1", {2, 3});
+    // Fill CPU 3 with tt_other (U=0.78) so CBS cannot fit on CPU 3.
+    // On CPU 2: tt_main (U=0.50), cbs_task (U=0.29) -> 0.81 > U_BOUND
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_tt2", "tt_main", 20000, 10000, 20000),   // CPU 2 (U=0.50)
+        MakeTtTask("wl_tt3", "tt_other", 50000, 39000, 50000),  // CPU 3 (U=0.78)
+        MakeCbsTask("wl_cbs", "cbs_29", 10000, 2900, 10000),    // Cannot fit on either CPU
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_FALSE(IsSuccess(result));
+    EXPECT_EQ(GetError(result).reason, InfeasibleReason::UtilizationExceeded);
+}
+
+TEST_F(GlobalSchedulerTest, MultiCpuFourCpusMixedTtAndCbsDistributed) {
+    SetAvailableCpus("node1", {4, 5, 6, 7});
+    // 2 TT workloads on CPUs 4 and 5; 2 CBS tasks placed on empty CPUs 6 and 7 (worst-fit)
+    std::vector<ClassifiedTask> tasks = {
+        MakeTtTask("wl_tt1", "tt_1", 10000, 3000, 5000),
+        MakeTtTask("wl_tt2", "tt_2", 20000, 4000, 10000),
+        MakeCbsTask("wl_cbs1", "cbs_1", 10000, 4000, 10000),
+        MakeCbsTask("wl_cbs2", "cbs_2", 10000, 4000, 10000),
+    };
+    auto result = scheduler_->generate_schedule("node1", tasks);
+    ASSERT_TRUE(IsSuccess(result));
+    EXPECT_EQ(GetTable(result).partitions_size(), 4);
+}
+
+// ─── 7. Capacity, Limits & Floating-Point Precision Edge Cases ──────────────
+
 TEST_F(GlobalSchedulerTest, UnrolledSlotsExceedingNodeCapacityFails) {
+    SetAvailableCpus("node1", {2, 3});
     // Non-harmonic periods on separate CPUs (1,000 us and 1,000,001 us)
     // produce LCM ≈ 1,000,001,000 us. Unrolled slots = 1,000,001 + 1000 > 2048.
-    // Must be rejected as TtSlotCapacityExceeded to prevent scheduler stalling.
     std::vector<ClassifiedTask> tasks = {
         MakeTtTask("wl_a", "task_fast", 1000, 100, 1000),
         MakeTtTask("wl_b", "task_coprime", 1000001, 100, 1000001),
@@ -335,7 +535,7 @@ TEST_F(GlobalSchedulerTest, UnrolledSlotsExceedingNodeCapacityFails) {
 }
 
 TEST_F(GlobalSchedulerTest, TtSlotCapacityExactBoundary) {
-    // Exact boundary test for MAX_NODE_TT_SLOTS (2048):
+    SetAvailableCpus("node1", {2, 3});
     // Case 1: Exactly 2048 slots (2047 + 1 = 2048) -> SUCCEEDS
     {
         std::vector<ClassifiedTask> tasks = {
@@ -367,8 +567,8 @@ TEST_F(GlobalSchedulerTest, TtSlotCapacityExactBoundary) {
 }
 
 TEST_F(GlobalSchedulerTest, HyperperiodExceedingUint32LimitFails) {
+    SetAvailableCpus("node1", {2, 3});
     // Large periods (3,000,000,000 us and 4,000,000,000 us) produce LCM = 12×10^9 us > UINT32_MAX.
-    // Must be rejected as TtSlotCapacityExceeded per REQ-011 AC-16 without representation loss.
     std::vector<ClassifiedTask> tasks = {
         MakeTtTask("wl_a", "task_3s", 3000000000u, 100, 3000000000u),
         MakeTtTask("wl_b", "task_4s", 4000000000u, 100, 4000000000u),
@@ -378,21 +578,57 @@ TEST_F(GlobalSchedulerTest, HyperperiodExceedingUint32LimitFails) {
     EXPECT_EQ(GetError(result).reason, InfeasibleReason::TtSlotCapacityExceeded);
 }
 
-TEST_F(GlobalSchedulerTest, MultipleTtWorkloadsGetSeparateCpus) {
-    // Two TT workloads should prefer separate CPUs
+TEST_F(GlobalSchedulerTest, UtilizationHelperBoundaryPrecision) {
+    // IEEE 754 double: 0.50 + 0.28 + 0.02 can exceed 0.80 by ~4.4e-17
+    EXPECT_TRUE(GlobalScheduler::is_utilization_admissible(0.78, 0.0));
+    EXPECT_TRUE(GlobalScheduler::is_utilization_admissible(0.50, 0.28));
+    EXPECT_TRUE(GlobalScheduler::is_utilization_admissible(0.0, 0.78));
+    EXPECT_FALSE(GlobalScheduler::is_utilization_admissible(0.7801, 0.0));
+    EXPECT_FALSE(GlobalScheduler::is_utilization_admissible(0.50, 0.2801));
+    EXPECT_FALSE(GlobalScheduler::is_utilization_admissible(1.0, 0.0));
+
+    EXPECT_NEAR(GlobalScheduler::available_cbs_bandwidth(0.50, 0.0), 0.28, 1e-9);
+    EXPECT_NEAR(GlobalScheduler::available_cbs_bandwidth(0.78, 0.0), 0.0, 1e-12);
+    EXPECT_DOUBLE_EQ(GlobalScheduler::available_cbs_bandwidth(0.85, 0.0), 0.0);
+}
+
+// ─── 8. End-to-End, Constants & Table Structure Verification ────────────────
+
+TEST_F(GlobalSchedulerTest, Ddr007SampleWorkloads) {
+    SetAvailableCpus("node1", {2, 3});
+    // From DDR-007 §5.1:
+    //   brake_ctrl    (L1, period=10ms,  wcet=2ms,   deadline=5ms)
+    //   steer_ctrl    (L1, period=20ms,  wcet=2ms,   deadline=10ms)
+    //   collision_det (L2, MIT=10ms,     wcet=1.5ms, deadline=10ms)
+    //   lidar_proc    (L2, MIT=5ms,      wcet=2ms,   deadline=5ms)
     std::vector<ClassifiedTask> tasks = {
-        MakeTtTask("wl_a", "task_a", 10000, 2000, 5000),
-        MakeTtTask("wl_b", "task_b", 10000, 2000, 5000),
+        MakeTtTask("brake", "brake_ctrl", 10000, 2000, 5000),
+        MakeTtTask("steer", "steer_ctrl", 20000, 2000, 10000),
+        MakeCbsTask("collision", "col_detect", 10000, 1500, 10000),
+        MakeCbsTask("lidar_proc", "lidar_main", 5000, 2000, 5000),
     };
+
     auto result = scheduler_->generate_schedule("node1", tasks);
     ASSERT_TRUE(IsSuccess(result));
 
     const auto& table = GetTable(result);
-    // With default 2 CPUs available, should get 2 partitions
-    EXPECT_GE(table.partitions_size(), 2);
-}
+    EXPECT_EQ(table.node_id(), "node1");
+    EXPECT_GT(table.hyperperiod_us(), 0u);
+    EXPECT_GT(table.partitions_size(), 0);
 
-// ─── Feasibility Constants ──────────────────────────────────────────────────
+    int total_tt = 0;
+    int total_cbs = 0;
+    for (int p = 0; p < table.partitions_size(); ++p) {
+        for (int l = 0; l < table.partitions(p).layers_size(); ++l) {
+            total_tt += table.partitions(p).layers(l).tt_slots_size();
+            total_cbs += table.partitions(p).layers(l).cbs_entries_size();
+        }
+        EXPECT_TRUE(table.partitions(p).cpuset().isolated());
+    }
+
+    EXPECT_EQ(total_tt, 3);
+    EXPECT_GE(total_cbs, 2);
+}
 
 TEST_F(GlobalSchedulerTest, FeasibilityConstants) {
     EXPECT_DOUBLE_EQ(GlobalScheduler::U_OVERHEAD, 0.02);
@@ -401,9 +637,8 @@ TEST_F(GlobalSchedulerTest, FeasibilityConstants) {
     EXPECT_EQ(GlobalScheduler::MAX_NODE_TT_SLOTS, 2048u);
 }
 
-// ─── Table Structure Verification ───────────────────────────────────────────
-
 TEST_F(GlobalSchedulerTest, TableHasRequiredFields) {
+    SetAvailableCpus("node1", {2});
     std::vector<ClassifiedTask> tasks = {
         MakeTtTask("brake", "brake_ctrl", 10000, 2000, 5000),
     };
@@ -414,10 +649,8 @@ TEST_F(GlobalSchedulerTest, TableHasRequiredFields) {
     EXPECT_FALSE(table.table_id().empty());
     EXPECT_EQ(table.node_id(), "node1");
     EXPECT_GT(table.hyperperiod_us(), 0u);
-    // epoch_ns is assigned per publication batch, not per node table.
     EXPECT_EQ(table.epoch_ns(), 0u);
 
-    // Check TT slot hashes are non-zero
     for (int p = 0; p < table.partitions_size(); ++p) {
         for (int l = 0; l < table.partitions(p).layers_size(); ++l) {
             const auto& layer = table.partitions(p).layers(l);
